@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -140,6 +141,9 @@ def default_paths(env: Optional[Dict[str, str]] = None) -> Dict[str, Path]:
         'source': clash_dir / 'airports/mango-clash.yaml',
         'share_nodes': share_dir / 'share-nodes.json',
         'exclude': share_dir / 'exclude.json',
+        # node pool (server worker): full state + the dead list render drops
+        'pool': share_dir / 'node-pool.json',
+        'pool_dead': share_dir / 'pool-dead.json',
         'out': share_dir / 'public/mango-share.yaml',
         'meta': share_dir / 'public/mango-share.meta.json',
     }
@@ -154,6 +158,58 @@ def load_json_list(path: Path) -> List[str]:
     if not isinstance(data, list):
         raise ValueError(f'{path}: expected a JSON list of node names')
     return [str(x) for x in data]
+
+
+def plan_drop(proxies: List[Dict[str, Any]], rules: List[Any],
+              exclude: List[str], pool_dead: List[str]) -> tuple:
+    """Names to remove from a full-scope render: exclude.json (operator)
+    plus the node pool's dead list. Returns (drop, pool_dropped, floor_hit).
+
+    - Safety floor: if pool_dead would leave fewer than max(5, 25%) of the
+      nodes, the pool is ignored (a probe-side outage must never empty the
+      subscription); exclude still applies.
+    - Nodes a kept node dials through (dialer-proxy) or a rule targets
+      directly are never dropped: removing them would break the config."""
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for p in proxies:
+        if isinstance(p, dict) and p.get('name'):
+            by_name[str(p['name'])] = p
+    total = len(by_name)
+    excl = set(exclude) & set(by_name)
+    dead = (set(pool_dead) & set(by_name)) - excl
+    floor_hit = False
+    if dead and total - len(excl | dead) < max(5, math.ceil(total * 0.25)):
+        dead, floor_hit = set(), True
+    drop = excl | dead
+    rule_targets = set()
+    for r in rules or []:
+        parts = [x.strip() for x in str(r).split(',')]
+        rule_targets.update(parts[1:])
+    while drop:
+        kept = set(by_name) - drop
+        needed = {str(by_name[n].get('dialer-proxy')) for n in kept
+                  if by_name[n].get('dialer-proxy')} | rule_targets
+        keep_back = drop & needed
+        if not keep_back:
+            break
+        drop -= keep_back
+    return drop, sorted(dead & drop), floor_hit
+
+
+def prune_groups(groups: List[Any], drop: set) -> List[Any]:
+    """Remove dropped node names from every group's member list; a group left
+    with no members and no provider falls back to DIRECT (an empty select
+    group is a hard error in mihomo/sing-box)."""
+    out: List[Any] = []
+    for g in groups or []:
+        if not isinstance(g, dict) or not isinstance(g.get('proxies'), list):
+            out.append(g)
+            continue
+        members = [m for m in g['proxies'] if m not in drop]
+        if not members and not g.get('use'):
+            members = ['DIRECT']
+        out.append(dict(g, proxies=members))
+    return out
 
 
 def _is_whitelisted(name: str, whitelist: List[str]) -> bool:
@@ -199,15 +255,17 @@ def select_nodes(
 
 
 def render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
-           out_path: Path, meta_path: Path) -> Dict[str, Any]:
+           out_path: Path, meta_path: Path,
+           pool_dead_path: Optional[Path] = None) -> Dict[str, Any]:
     return _render(source_path, share_nodes_path, exclude_path, out_path, meta_path,
-                   scope=share_scope())
+                   pool_dead_path=pool_dead_path, scope=share_scope())
 
 
 def render_user(source_path: Path, share_nodes_path: Path, exclude_path: Path,
                 out_path: Path, meta_path: Optional[Path] = None, *,
                 user: Dict[str, Any], cred_map: List[Dict[str, Any]],
-                other_secrets: List[str]) -> Dict[str, Any]:
+                other_secrets: List[str],
+                pool_dead_path: Optional[Path] = None) -> Dict[str, Any]:
     """Phase-2 per-user render: same pipeline, but every mapped node gets the
     user's own credentials substituted in. `other_secrets` are credential
     values belonging to OTHER users — if any of them appears in the output
@@ -218,6 +276,7 @@ def render_user(source_path: Path, share_nodes_path: Path, exclude_path: Path,
                    user_credentials=user.get('credentials') or {},
                    cred_map=cred_map,
                    other_secrets=other_secrets,
+                   pool_dead_path=pool_dead_path,
                    scope=share_scope())
 
 
@@ -249,24 +308,18 @@ def _substitute_credentials(picked: List[Dict[str, Any]],
 
 
 def _render_full_mirror(source_path: Path, out_path: Path,
-                        meta_path: Optional[Path]) -> Dict[str, Any]:
-    """Full scope = byte-level mirror of the gateway's own client export:
-    the output is the source file verbatim, so subscribers get byte-identical
-    config to the owner's devices. The gateway already kernel-validates the
-    candidate before writing it; alignment is computed against its meta."""
+                        meta_path: Optional[Path],
+                        exclude: Optional[List[str]] = None,
+                        pool_dead: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Full scope = mirror of the gateway's own client export. With nothing
+    to drop the output is the source file verbatim (byte-identical to the
+    owner's devices; the gateway already kernel-validated it). When exclude /
+    the node pool's dead list remove nodes, the document is re-serialized
+    with those proxies and their group memberships pruned. Alignment always
+    compares the SOURCE against the gateway meta."""
     source_bytes = source_path.read_bytes()
-    sha = hashlib.sha256(source_bytes).hexdigest()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix='mango-share-', suffix='.tmp', dir=str(out_path.parent))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(source_bytes)
-        os.chmod(tmp, 0o640)
-        os.replace(tmp, out_path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    source_sha = hashlib.sha256(source_bytes).hexdigest()
+    doc = None
     node_count = 0
     try:
         import yaml as _yaml
@@ -274,10 +327,38 @@ def _render_full_mirror(source_path: Path, out_path: Path,
         node_count = len((doc or {}).get('proxies') or [])
     except Exception:
         pass
+    pool_dropped: List[str] = []
+    floor_hit = False
+    out_bytes = source_bytes
+    source_count = node_count
+    if isinstance(doc, dict) and (exclude or pool_dead):
+        proxies = doc.get('proxies') or []
+        drop, pool_dropped, floor_hit = plan_drop(
+            proxies, doc.get('rules') or [], exclude or [], pool_dead or [])
+        if drop:
+            pruned = dict(doc)
+            pruned['proxies'] = [p for p in proxies
+                                 if not (isinstance(p, dict) and p.get('name') in drop)]
+            pruned['proxy-groups'] = prune_groups(doc.get('proxy-groups') or [], drop)
+            out_bytes = _yaml.safe_dump(pruned, allow_unicode=True, sort_keys=False,
+                                        default_flow_style=False).encode('utf-8')
+            node_count = len(pruned['proxies'])
+    sha = hashlib.sha256(out_bytes).hexdigest()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix='mango-share-', suffix='.tmp', dir=str(out_path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(out_bytes)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, out_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     aligned = None
     try:
         gm = json.loads((source_path.parent / 'mango-clash.meta.json').read_text(encoding='utf-8'))
-        aligned = (gm.get('sha256') == sha)
+        aligned = (gm.get('sha256') == source_sha)
     except Exception:
         pass
     meta = {
@@ -286,8 +367,10 @@ def _render_full_mirror(source_path: Path, out_path: Path,
         'sha256': sha,
         'node_count': node_count,
         'aligned': aligned,
-        'source_sha256': sha,
-        'source_node_count': node_count,
+        'source_sha256': source_sha,
+        'source_node_count': source_count,
+        'pool_dropped': pool_dropped,
+        'pool_floor_hit': floor_hit,
         'whitelist_count': None,
         'generated_at': __json_ts__(),
     }
@@ -310,11 +393,15 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
             user_credentials: Optional[Dict[str, Any]] = None,
             cred_map: Optional[List[Dict[str, Any]]] = None,
             other_secrets: Optional[List[str]] = None,
+            pool_dead_path: Optional[Path] = None,
             scope: str = 'whitelist') -> Dict[str, Any]:
+    exclude = load_json_list(exclude_path)
+    pool_dead = load_json_list(pool_dead_path) if pool_dead_path else []
     if scope == 'full' and user_credentials is None:
-        # byte-level mirror: no parse, no re-serialization, zero drift from
-        # the gateway's own client export
-        return _render_full_mirror(source_path, out_path, meta_path)
+        # mirror of the gateway's own client export (verbatim unless the
+        # exclude list / node pool drops something)
+        return _render_full_mirror(source_path, out_path, meta_path,
+                                   exclude=exclude, pool_dead=pool_dead)
     import yaml
 
     doc = yaml.safe_load(source_path.read_text(encoding='utf-8'))
@@ -322,16 +409,16 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         raise ValueError(f'{source_path}: not a mapping')
     proxies = doc.get('proxies') or []
     whitelist = load_json_list(share_nodes_path)
-    exclude = load_json_list(exclude_path)
 
     if scope == 'full':
         # per-user path only (plain render took the mirror above): parse the
         # gateway client export and re-serialize with the user's credentials
-        picked = select_nodes_full(proxies, exclude)
-        public_groups = doc.get('proxy-groups') or []
         public_rules = list(doc.get('rules') or [])
+        drop, _, _ = plan_drop(proxies, public_rules, exclude, pool_dead)
+        picked = select_nodes_full(proxies, sorted(drop))
+        public_groups = prune_groups(doc.get('proxy-groups') or [], drop)
     else:
-        picked = select_nodes(proxies, whitelist, exclude)
+        picked = select_nodes(proxies, whitelist, exclude + pool_dead)
         public_groups, public_rules = None, None
     names = [p['name'] for p in picked]
     if not names:
@@ -468,7 +555,8 @@ def main() -> int:
     args = ap.parse_args()
 
     paths = default_paths()
-    meta = render(paths['source'], paths['share_nodes'], paths['exclude'], paths['out'], paths['meta'])
+    meta = render(paths['source'], paths['share_nodes'], paths['exclude'], paths['out'], paths['meta'],
+                  pool_dead_path=paths['pool_dead'])
     print(json.dumps(meta, ensure_ascii=False))
 
     if args.check_leaks:

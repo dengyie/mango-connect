@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pages
 import format_converters as fmtconv
+import node_pool
 import render_public
 import share_constants as const
 from share_constants import clash_dir
@@ -76,13 +77,14 @@ class ShareState:
         # per-user render memo: uid -> (inputs sha, sha256 of output)
         self.user_renders: Dict[str, tuple] = {}
         self._user_render_lock = threading.Lock()
+        self.pool = node_pool.NodePool(self.paths['pool'], self.paths['pool_dead'])
 
     def _hash_inputs(self, h) -> None:
-        """Feed every render input into `h`. share-nodes.json and
-        exclude.json are optional (render reads a missing one as empty), so a
+        """Feed every render input into `h`. share-nodes.json, exclude.json
+        and pool-dead.json are optional (render reads a missing one as empty), so a
         fresh install without them must still render; the source pool is
         mandatory and its absence raises."""
-        for key in ('source', 'share_nodes', 'exclude'):
+        for key in ('source', 'share_nodes', 'exclude', 'pool_dead'):
             try:
                 data = self.paths[key].read_bytes()
             except FileNotFoundError:
@@ -141,62 +143,47 @@ class ShareState:
             meta = render_public.render_user(
                 self.paths['source'], self.paths['share_nodes'],
                 self.paths['exclude'], out_path, None,
-                user=user, cred_map=cred_map, other_secrets=other_secrets)
+                user=user, cred_map=cred_map, other_secrets=other_secrets,
+                pool_dead_path=self.paths['pool_dead'])
             self.user_renders[uid] = (sha_in, meta['sha256'])
             return out_path, meta['sha256']
 
     def gateway_nodes(self) -> tuple:
-        """Live per-node status from the gateway controller: normalized
-        [{name,type,udp,alive,delay,checkedAt}] (no server/uuid - the Clash
-        API does not expose addresses). 15s cache; stale cache on failure."""
-        now = time.time()
-        with _GATEWAY_CACHE_LOCK:
-            cached = (list(_GATEWAY_CACHE['nodes'])
-                      if now - float(_GATEWAY_CACHE['ts']) < 15
-                      and _GATEWAY_CACHE['nodes'] else [])
-        if cached:
-            _schedule_reprobe(cached)
-            return _overlay_verdicts(cached), ''
-        import urllib.request
-        nodes: list = []
-        err = ''
-        try:
-            secret = Path(_GATEWAY_SECRET_FILE).read_text(encoding='utf-8').strip()
-            req = urllib.request.Request(
-                _GATEWAY_API.rstrip('/') + '/proxies',
-                headers={'Authorization': f'Bearer {secret}',
-                         'User-Agent': 'mango-share/1'})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode('utf-8', 'replace'))
-            nodes = _normalize_gateway_proxies(data)
-            err = ''
-            # Remember every healthy observation too: the next bulk sweep
-            # flaps ~30 live rows to delay=0 for a minute or two. Rows that
-            # really die are still caught - they show offline in the raw
-            # payload, get re-probed within one round, and a failed probe
-            # drops the verdict.
-            with _GATEWAY_VERDICT_LOCK:
-                for n in nodes:
-                    if n['alive'] and n['delay']:
-                        _GATEWAY_VERDICT[n['name']] = (now, n['delay'])
-        except Exception as e:  # stale cache beats a hard error for the page
-            # Detail goes to the log only: exception text can carry the
-            # controller URL or filesystem paths.
-            sys.stderr.write(f'mango-share gateway fetch failed: {e!r}\n')
-            err = 'gateway unreachable'
-        with _GATEWAY_CACHE_LOCK:
-            if nodes:
-                _GATEWAY_CACHE.update(ts=now, nodes=nodes)
-            else:
-                # Keep the last good rows (marked stale by the error) and
-                # back off for a few seconds instead of hammering a dead
-                # controller on every page view.
-                nodes = list(_GATEWAY_CACHE['nodes'])
-                _GATEWAY_CACHE['ts'] = now - 10 if nodes else 0
-        if not nodes:
-            return [], err
-        _schedule_reprobe(list(nodes))
-        return _overlay_verdicts(list(nodes)), err
+        """Node rows for /nodes from the self-maintained pool (verdicts come
+        from our own probes through the gateway, see node_pool):
+        [{name,type,udp,status,alive,delay,checkedAt,fails,since}]. No
+        server/uuid ever leaves. ([], error) while the pool has no verdicts."""
+        snap = self.pool.snapshot()
+        info = {n['name']: n for n in _export_nodes(self.paths['source'])}
+        rows = []
+        for name, rec in snap.items():
+            status = rec['status']
+            if status != node_pool.UNMANAGED and not rec.get('probed'):
+                status = 'pending'
+            meta = info.get(name, {})
+            last = rec.get('last_probe')
+            rows.append({
+                'name': name,
+                'type': meta.get('type', ''),
+                'udp': bool(meta.get('udp')),
+                'status': status,
+                'alive': status == node_pool.ALIVE,
+                'delay': (rec.get('delay') if status in (node_pool.ALIVE, node_pool.SUSPECT)
+                          and not rec.get('fails') else None),
+                'checkedAt': (time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(last))
+                              if last else None),
+                'fails': int(rec.get('fails') or 0),
+                'since': int(rec.get('since') or 0),
+            })
+        order = {node_pool.ALIVE: 0, node_pool.SUSPECT: 1, 'pending': 2,
+                 node_pool.UNMANAGED: 3, node_pool.DEAD: 4}
+        rows.sort(key=lambda n: (order.get(n['status'], 5),
+                                 n['delay'] if n['delay'] is not None else 1 << 30,
+                                 n['name'].lower()))
+        err = self.pool.last_error
+        if not any(r['status'] != 'pending' for r in rows):
+            return [], err or 'node pool warming up'
+        return rows, err
 
     def ensure_fresh(self) -> dict:
         """Re-render when any input changed. Serialized by a lock: concurrent
@@ -208,6 +195,7 @@ class ShareState:
                 meta = render_public.render(
                     self.paths['source'], self.paths['share_nodes'],
                     self.paths['exclude'], self.paths['out'], self.paths['meta'],
+                    pool_dead_path=self.paths['pool_dead'],
                 )
                 self.last_inputs_sha = inputs_sha
                 self.last_meta = meta
@@ -236,69 +224,86 @@ _CONVERT_CACHE: 'OrderedDict[tuple, bytes]' = OrderedDict()
 _CONVERT_CACHE_MAX = 16
 _CONVERT_LOCK = threading.Lock()
 
-# Gateway controller (mihomo) for the live node-status page. Secret file is
-# group-readable by the service user; responses cached 15s to keep /proxies load
-# off the controller when the page auto-refreshes.
+# Gateway controller (mihomo): probes for the node pool. Secret file is
+# group-readable by the service user.
 _GATEWAY_API = os.environ.get('SHARE_GATEWAY_API', 'http://127.0.0.1:9090')
 _GATEWAY_SECRET_FILE = os.environ.get(
     'SHARE_GATEWAY_SECRET', str(clash_dir() / '.controller-secret'))
 _GATEWAY_GROUP_TYPES = {'selector', 'urltest', 'fallback', 'loadbalance',
                         'relay', 'direct', 'reject', 'rejectdrop',
                         'compatible', 'pass', 'passrule', 'dns'}
-_GATEWAY_CACHE: Dict[str, Any] = {'ts': 0.0, 'nodes': []}
-_GATEWAY_CACHE_LOCK = threading.Lock()
-# Health-check misfires: mihomo runs url-test/fallback group probes lazily
-# (~5min) and, at 100+ nodes, one bulk sweep marks reachable nodes dead
-# (per-probe timeout under load); fallback groups stop after the first
-# survivor, so a member can carry a days-old verdict. The status page would
-# then show live nodes as 离线. We re-test the offline rows through the
-# controller's own delay API in the background (a success also rewrites
-# mihomo's history, replacing the stale sweep), throttled and batched.
+# Node pool worker: every export node is probed through the controller's
+# delay API (the gateway dials relay-chained nodes through their relay, so a
+# verdict means "works through our clash"); node_pool keeps the state
+# machine and writes pool-dead.json, which the renderer drops.
 _GATEWAY_PROBE_URL = 'http://www.gstatic.com/generate_204'
 _GATEWAY_PROBE_TIMEOUT_MS = 5000
-_GATEWAY_PROBE_WORKERS = 4      # low fan-out: a wide burst is what misfires
-_GATEWAY_PROBE_GAP = 120        # min seconds between background rounds
-_GATEWAY_PROBE_BATCH = 150      # rows re-tested per round (stalest first)
-_GATEWAY_PROBE_LOCK = threading.Lock()
-_GATEWAY_PROBE: Dict[str, Any] = {'running': False, 'last': 0.0}
-# Our own recent successes. mihomo's next bulk sweep (url-test every ~5 min)
-# rewrites history back to delay=0 for the same false negatives, so a revived
-# row would flip to 离线 again minutes later. A direct, low-concurrency probe
-# success within this window outranks a later sweep 'dead'.
-_GATEWAY_VERDICT_TTL = 900
-_GATEWAY_VERDICT: Dict[str, tuple] = {}   # name -> (ts, delay)
-_GATEWAY_VERDICT_LOCK = threading.Lock()
+_POOL_TICK = 30                 # seconds between worker passes
+_POOL_BATCH = 40                # due nodes probed per pass (stalest first)
+_POOL_WORKERS = 4               # low fan-out: a wide burst misfires
+_POOL_MANAGED_TTL = 300         # gateway /proxies name list cache
+_POOL_MANAGED: Dict[str, Any] = {'ts': 0.0, 'names': None}
+_EXPORT_CACHE: Dict[str, Any] = {'key': None, 'nodes': []}
+_EXPORT_LOCK = threading.Lock()
 
 
-def _overlay_verdicts(nodes: list, now: Optional[float] = None) -> list:
-    now = time.time() if now is None else now
-    with _GATEWAY_VERDICT_LOCK:
-        for name in [k for k, (ts, _) in _GATEWAY_VERDICT.items()
-                     if now - ts > _GATEWAY_VERDICT_TTL]:
-            del _GATEWAY_VERDICT[name]
-        verdicts = dict(_GATEWAY_VERDICT)
-    out = []
-    for n in nodes:
-        v = verdicts.get(n['name'])
-        if v and not n.get('alive'):
-            n = dict(n, alive=True, delay=v[1], rechecked=True,
-                     checkedAt=time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(v[0])))
-        out.append(n)
-    out.sort(key=lambda n: (
-        n['delay'] is None or not n['alive'],
-        n['delay'] if n['delay'] is not None else 1 << 30,
-        n['name'].lower()))
-    return out
+def _export_nodes(source: Path) -> list:
+    """[{name,type,udp}] of the client export (what subscribers receive),
+    minus loop-guard / fake rows; cached on (mtime, size)."""
+    try:
+        st = source.stat()
+    except OSError:
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    with _EXPORT_LOCK:
+        if _EXPORT_CACHE['key'] == key:
+            return list(_EXPORT_CACHE['nodes'])
+    try:
+        import yaml
+        doc = yaml.safe_load(source.read_text(encoding='utf-8')) or {}
+        picked = render_public.select_nodes_full(doc.get('proxies') or [], [])
+    except Exception as e:
+        sys.stderr.write(f'mango-share export parse failed: {e!r}\n')
+        return []
+    nodes = [{'name': str(p['name']), 'type': str(p.get('type') or ''),
+              'udp': bool(p.get('udp'))} for p in picked]
+    with _EXPORT_LOCK:
+        _EXPORT_CACHE.update(key=key, nodes=nodes)
+    return list(nodes)
 
 
 def _gateway_secret() -> str:
     return Path(_GATEWAY_SECRET_FILE).read_text(encoding='utf-8').strip()
 
 
-def _probe_delay(name: str, secret: str):
-    """Live delay for one node via the controller. A success also rewrites
-    mihomo's own history entry, so the bogus bulk-sweep verdict is replaced
-    everywhere, not just in our cache."""
+def _gateway_managed(now: Optional[float] = None) -> Optional[set]:
+    """Proxy names the gateway has loaded (probe-able); None = unreachable."""
+    import urllib.request
+    now = time.time() if now is None else now
+    if (_POOL_MANAGED['names'] is not None
+            and now - float(_POOL_MANAGED['ts']) < _POOL_MANAGED_TTL):
+        return _POOL_MANAGED['names']
+    try:
+        req = urllib.request.Request(
+            _GATEWAY_API.rstrip('/') + '/proxies',
+            headers={'Authorization': f'Bearer {_gateway_secret()}',
+                     'User-Agent': 'mango-share/1'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+    except Exception as e:
+        # detail to the log only: exception text can carry the controller URL
+        sys.stderr.write(f'mango-share gateway fetch failed: {e!r}\n')
+        return None
+    names = {n['name'] for n in _normalize_gateway_proxies(data)}
+    _POOL_MANAGED.update(ts=now, names=names)
+    return names
+
+
+def _probe_delay(name: str, secret: str) -> tuple:
+    """One delay test via the controller -> (outcome, delay_ms).
+    ok: 200 with a positive delay; fail: the controller says the node timed
+    out / errored (504/503); error: anything that is OUR side (controller
+    unreachable, auth, unknown name) - errors never count against a node."""
     import urllib.error
     import urllib.parse
     import urllib.request
@@ -315,57 +320,65 @@ def _probe_delay(name: str, secret: str):
                 req, timeout=_GATEWAY_PROBE_TIMEOUT_MS / 1000 + 3) as resp:
             data = json.loads(resp.read().decode('utf-8', 'replace'))
         delay = data.get('delay')
-        return int(delay) if isinstance(delay, int) and delay > 0 else None
+        if isinstance(delay, int) and delay > 0:
+            return node_pool.OK, delay
+        return node_pool.FAIL, None
     except urllib.error.HTTPError as e:
-        e.close()  # 504 on timeout / 503 on failure still carries a body
-        return None
+        e.close()
+        return (node_pool.FAIL, None) if e.code in (503, 504) else (node_pool.ERROR, None)
     except Exception:
-        return None
+        return node_pool.ERROR, None
 
 
-def _probe_round(names: list) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+def _probe_node(name: str) -> tuple:
+    """A failure must be confirmed by a second attempt (single timeouts are
+    common under load); errors are returned as-is."""
     try:
         secret = _gateway_secret()
-        if secret:
-            with ThreadPoolExecutor(max_workers=_GATEWAY_PROBE_WORKERS) as pool:
-                results = list(pool.map(lambda n: _probe_delay(n, secret), names))
-            now = time.time()
-            with _GATEWAY_VERDICT_LOCK:
-                for name, delay in zip(names, results):
-                    if delay:
-                        _GATEWAY_VERDICT[name] = (now, delay)
-                    else:
-                        _GATEWAY_VERDICT.pop(name, None)
-    except Exception:
-        pass
-    finally:
-        # Re-probing rewrote mihomo's history for the reachable ones; expire
-        # the 15s cache so the next read shows the corrected verdict.
-        with _GATEWAY_CACHE_LOCK:
-            _GATEWAY_CACHE['ts'] = 0.0
-        with _GATEWAY_PROBE_LOCK:
-            _GATEWAY_PROBE['running'] = False
+    except OSError:
+        return node_pool.ERROR, None
+    outcome, delay = _probe_delay(name, secret)
+    if outcome == node_pool.FAIL:
+        outcome, delay = _probe_delay(name, secret)
+    return outcome, delay
 
 
-def _schedule_reprobe(nodes: list) -> None:
-    """Kick a throttled background re-test of rows currently shown offline."""
-    dead = [n for n in nodes if not n.get('alive')]
-    if not dead:
-        return
-    now = time.time()
-    with _GATEWAY_PROBE_LOCK:
-        if (_GATEWAY_PROBE['running']
-                or now - float(_GATEWAY_PROBE['last']) < _GATEWAY_PROBE_GAP):
-            return
-        _GATEWAY_PROBE['running'] = True
-        _GATEWAY_PROBE['last'] = now
-    # Stalest first so a capped batch still rotates through every dead row
-    # (truly-dead nodes would otherwise monopolise each round forever).
-    dead.sort(key=lambda n: (n.get('checkedAt') is not None,
-                             n.get('checkedAt') or ''))
-    names = [n['name'] for n in dead[:_GATEWAY_PROBE_BATCH]]
-    threading.Thread(target=_probe_round, args=(names,), daemon=True).start()
+def pool_tick(now: Optional[float] = None) -> list:
+    """One worker pass: sync membership with the export, probe due nodes,
+    re-render when the dead set moved. Returns the status changes."""
+    pool = STATE.pool
+    names = [n['name'] for n in _export_nodes(STATE.paths['source'])]
+    if not names:
+        return []
+    managed = _gateway_managed(now)
+    pool.sync(names, managed, now)
+    if managed is None:
+        pool.last_error = 'gateway unreachable'
+        pool.save()
+        return []
+    changes = pool.run_round(_probe_node, now=now, limit=_POOL_BATCH,
+                             workers=_POOL_WORKERS)
+    for name, old, new in changes:
+        print(f'mango-share pool: {name} {old} -> {new}', flush=True)
+    if any(node_pool.DEAD in (old, new) for _, old, new in changes):
+        try:
+            STATE.ensure_fresh()
+        except Exception as e:
+            sys.stderr.write(f'mango-share re-render after pool change failed: {e!r}\n')
+    return changes
+
+
+def _pool_loop() -> None:
+    while True:
+        try:
+            pool_tick()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(_POOL_TICK)
+
+
+def start_pool_worker() -> None:
+    threading.Thread(target=_pool_loop, name='node-pool', daemon=True).start()
 
 # Landing-page region badges, keyed by the rendered output's sha256.
 _REGIONS_CACHE: Dict[str, Any] = {'sha': '', 'regions': []}
@@ -906,9 +919,13 @@ class Handler(BaseHTTPRequestHandler):
         if not nodes and err:
             self._send(503, json.dumps({'error': err}).encode())
             return
+        counts = STATE.pool.counts()
         payload = {'ok': True, 'nodes': nodes,
                    'fetchedAt': int(time.time()),
-                   'alive': sum(1 for n in nodes if n['alive'])}
+                   'alive': counts[node_pool.ALIVE],
+                   'counts': counts,
+                   'lastRound': STATE.pool.last_round,
+                   'error': err or None}
         self._send(200, json.dumps(payload, ensure_ascii=False).encode(),
                    headers=[('Cache-Control', 'no-store')])
 
@@ -927,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                    'render_rev': const.RENDER_REV,
                    'share_scope': render_public.share_scope(),
                    'aligned_with_gateway': STATE.last_meta.get('aligned'),
+                   'node_pool': STATE.pool.counts(),
                    'per_user_yaml': bool(PER_USER_YAML)}
         self._send(200, json.dumps(payload).encode(),
                    headers={'Cache-Control': 'no-store'})
@@ -1644,6 +1662,8 @@ def main() -> int:
     except Exception as e:
         print(f'mango-share WARN initial render failed: {e}', flush=True)
 
+    if os.environ.get('SHARE_NODE_POOL', '1') != '0':
+        start_pool_worker()
     srv = ThreadingHTTPServer((args.listen, args.port), Handler)
     print(f'mango-share listening on {args.listen}:{args.port}', flush=True)
     srv.serve_forever()

@@ -82,7 +82,7 @@ for p in sorted(pathlib.Path(sys.argv[1]).glob("*.py")):
   ( cd "$work/new/src" && SHARE_STATE_DIR="$STATE" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -c '
 import sys; sys.path.insert(0, ".")
 for m in ("share_constants", "state_backup", "users", "tokens", "notify",
-          "format_converters", "render_public", "sync_exclude", "pages", "server"):
+          "format_converters", "render_public", "node_pool", "sync_exclude", "pages", "server"):
     __import__(m)
 ' ) || die "release does not import"
 

@@ -2604,34 +2604,238 @@ class _FakeGateway:
         self.httpd.server_close()
 
 
-class GatewayReprobeTests(unittest.TestCase):
-    """Regression for '/nodes shows many nodes offline': mihomo's url-test /
-    fallback group probes run lazily (~5 min) and, at 100+ nodes, a bulk sweep
-    times out under load while fallback groups stop probing after the first
-    survivor - so reachable nodes can carry a stale 'dead' verdict. The status
-    reader must re-test offline rows through the controller's own delay API
-    (which rewrites mihomo's history) so the page recovers the real verdict."""
+class NodePoolStateTests(unittest.TestCase):
+    """node_pool state machine: alive -3 fails-> suspect -10 fails-> dead,
+    dead -1 ok-> suspect -2 oks-> alive; errors never count."""
+
+    def setUp(self):
+        import node_pool as np_
+        self.np = np_
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rec(self, outcomes, now=1000.0, step=1.0):
+        rec = self.np.new_record(now)
+        changes = []
+        for o in outcomes:
+            now += step
+            ch = self.np.apply_outcome(rec, o, 100 if o == self.np.OK else None, now)
+            if ch:
+                changes.append(ch)
+        return rec, changes
+
+    def test_first_probe_decides_initial_state(self):
+        np_ = self.np
+        rec, ch = self._rec([np_.OK])
+        self.assertEqual(rec['status'], np_.ALIVE)
+        self.assertEqual(rec['delay'], 100)
+        rec, ch = self._rec([np_.FAIL])
+        self.assertEqual(rec['status'], np_.SUSPECT)
+        self.assertEqual(rec['fails'], 1)
+
+    def test_alive_needs_three_consecutive_failures(self):
+        np_ = self.np
+        rec, _ = self._rec([np_.OK, np_.FAIL, np_.FAIL])
+        self.assertEqual(rec['status'], np_.ALIVE)
+        rec, _ = self._rec([np_.OK, np_.FAIL, np_.FAIL, np_.OK, np_.FAIL, np_.FAIL])
+        self.assertEqual(rec['status'], np_.ALIVE, 'a success resets the streak')
+        rec, ch = self._rec([np_.OK, np_.FAIL, np_.FAIL, np_.FAIL])
+        self.assertEqual(rec['status'], np_.SUSPECT)
+        self.assertEqual(rec['fails'], 0, 'suspect counts its own streak')
+        self.assertEqual(ch[-1], (np_.ALIVE, np_.SUSPECT))
+        self.assertEqual(rec['next_due'] - rec['last_probe'], np_.INTERVAL[np_.SUSPECT])
+
+    def test_suspect_to_dead_after_ten_failures_and_daily_recheck(self):
+        np_ = self.np
+        rec, _ = self._rec([np_.FAIL] * 9)           # 1st -> suspect(1), +8
+        self.assertEqual(rec['status'], np_.SUSPECT)
+        rec, ch = self._rec([np_.FAIL] * 10)
+        self.assertEqual(rec['status'], np_.DEAD)
+        self.assertEqual(ch[-1], (np_.SUSPECT, np_.DEAD))
+        self.assertEqual(rec['next_due'] - rec['last_probe'], 86400)
+
+    def test_dead_revives_into_suspect_then_alive_with_hysteresis(self):
+        np_ = self.np
+        rec, ch = self._rec([np_.FAIL] * 10 + [np_.OK])
+        self.assertEqual(rec['status'], np_.SUSPECT)
+        self.assertEqual(ch[-1], (np_.DEAD, np_.SUSPECT))
+        self.np.apply_outcome(rec, np_.FAIL, None, 5000)
+        self.np.apply_outcome(rec, np_.OK, 90, 5001)
+        self.assertEqual(rec['status'], np_.SUSPECT, 'oks must be consecutive')
+        self.np.apply_outcome(rec, np_.OK, 90, 5002)
+        self.assertEqual(rec['status'], np_.ALIVE)
+
+    def test_errors_never_count(self):
+        np_ = self.np
+        rec, _ = self._rec([np_.OK] + [np_.ERROR] * 20)
+        self.assertEqual(rec['status'], np_.ALIVE)
+        self.assertEqual(rec['fails'], 0)
+        self.assertEqual(rec['next_due'] - 1021.0, np_.ERROR_RETRY)
+
+    def _pool(self):
+        return self.np.NodePool(self.root / 'pool.json', self.root / 'dead.json')
+
+    def test_sync_tracks_export_and_unmanaged(self):
+        np_ = self.np
+        pool = self._pool()
+        pool.sync(['a', 'b', 'v6'], {'a', 'b'}, now=10)
+        snap = pool.snapshot()
+        self.assertEqual(snap['v6']['status'], np_.UNMANAGED)
+        self.assertEqual(pool.due(10, 10), ['a', 'b'])
+        pool.sync(['a', 'v6'], None, now=11)       # gateway down: no reclassify
+        self.assertEqual(set(pool.snapshot()), {'a', 'v6'})
+        self.assertEqual(pool.snapshot()['v6']['status'], np_.UNMANAGED)
+        pool.sync(['a', 'v6'], {'a', 'v6'}, now=12)
+        self.assertEqual(pool.snapshot()['v6']['status'], np_.SUSPECT)
+        self.assertFalse(pool.snapshot()['v6']['probed'])
+
+    def test_round_persists_and_mirrors_dead_list(self):
+        np_ = self.np
+        pool = self._pool()
+        pool.sync(['a', 'b', 'c', 'gone'], {'a', 'b', 'c', 'gone'}, now=0)
+        probe = lambda n: (np_.FAIL, None) if n == 'gone' else (np_.OK, 50)
+        t = 0
+        for _ in range(12):
+            pool.run_round(probe, now=t, workers=2)
+            t += 1800
+        self.assertEqual(pool.snapshot()['gone']['status'], np_.DEAD)
+        self.assertEqual(json.loads((self.root / 'dead.json').read_text())['nodes'], ['gone'])
+        again = self._pool()
+        self.assertEqual(again.snapshot()['gone']['status'], np_.DEAD)
+        self.assertEqual(again.counts()[np_.ALIVE], 3)
+        self.assertTrue(any(e['to'] == np_.DEAD for e in again.events))
+
+    def test_breaker_discards_failures_when_canaries_fail_too(self):
+        np_ = self.np
+        pool = self._pool()
+        pool.sync(['a', 'b', 'c', 'x'], {'a', 'b', 'c', 'x'}, now=0)
+        pool.run_round(lambda n: (np_.OK, 40), now=0)        # all alive
+        # gateway host loses its uplink: every probe fails
+        for k in range(1, 6):
+            # only x is due (shift the others into the future)
+            with pool.lock:
+                for n in 'abc':
+                    pool.nodes[n]['next_due'] = 1e12
+                pool.nodes['x']['next_due'] = 0
+            pool.run_round(lambda n: (np_.FAIL, None), now=600 * k)
+        self.assertEqual(pool.snapshot()['x']['status'], np_.ALIVE)
+        self.assertEqual(pool.snapshot()['x']['fails'], 0)
+        self.assertIn('breaker', pool.last_error)
+        # canaries fine -> x's failures are real and count
+        for k in range(6, 9):
+            with pool.lock:
+                pool.nodes['x']['next_due'] = 0
+            pool.run_round(lambda n: (np_.FAIL, None) if n == 'x' else (np_.OK, 40),
+                           now=600 * k)
+        self.assertEqual(pool.snapshot()['x']['status'], np_.SUSPECT)
+
+
+class PoolRenderTests(unittest.TestCase):
+    """Full-scope render drops pool-dead nodes, prunes group members, keeps
+    relay targets, and refuses to gut the subscription."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._scope = os.environ.get('SHARE_SCOPE')
+        os.environ['SHARE_SCOPE'] = 'full'
+        nodes = [f'n{i}' for i in range(8)]
+        lines = ['mixed-port: 7890', 'proxies:']
+        for n in nodes:
+            lines.append(f'- {{name: {n}, type: socks5, server: 192.0.2.1, port: 1080}}')
+        lines.append('- {name: relay, type: socks5, server: 192.0.2.2, port: 1080}')
+        lines.append('- {name: chained, type: socks5, server: 192.0.2.3, port: 1080, dialer-proxy: relay}')
+        lines.append('proxy-groups:')
+        lines.append('- {name: PROXY, type: select, proxies: [AUTO, ' + ', '.join(nodes) + ', chained, DIRECT]}')
+        lines.append('- {name: AUTO, type: url-test, url: "http://x/", interval: 300, proxies: [' + ', '.join(nodes) + ']}')
+        lines.append('- {name: ONLY7, type: select, proxies: [n7]}')
+        lines.append('rules:')
+        lines.append('- MATCH,PROXY')
+        self.src = self.root / 'mango-clash.yaml'
+        self.src.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        self.excl = self.root / 'exclude.json'
+        self.excl.write_text('[]', encoding='utf-8')
+        self.dead = self.root / 'pool-dead.json'
+        self.out = self.root / 'out.yaml'
+        self.meta = self.root / 'out.meta.json'
+
+    def tearDown(self):
+        if self._scope is None:
+            os.environ.pop('SHARE_SCOPE', None)
+        else:
+            os.environ['SHARE_SCOPE'] = self._scope
+        self.tmp.cleanup()
+
+    def _render(self, dead):
+        import yaml
+        self.dead.write_text(json.dumps({'nodes': dead}), encoding='utf-8')
+        meta = rp.render(self.src, self.root / 'none.json', self.excl, self.out,
+                         self.meta, pool_dead_path=self.dead)
+        return meta, yaml.safe_load(self.out.read_text(encoding='utf-8'))
+
+    def test_no_dead_is_verbatim_mirror(self):
+        meta, _ = self._render([])
+        self.assertEqual(self.out.read_bytes(), self.src.read_bytes())
+        self.assertEqual(meta['pool_dropped'], [])
+
+    def test_dead_nodes_removed_and_groups_pruned(self):
+        meta, doc = self._render(['n7', 'relay', 'not-in-export'])
+        names = [p['name'] for p in doc['proxies']]
+        self.assertNotIn('n7', names)
+        self.assertIn('relay', names, 'dialer-proxy target of a kept node stays')
+        groups = {g['name']: g['proxies'] for g in doc['proxy-groups']}
+        self.assertNotIn('n7', groups['PROXY'])
+        self.assertNotIn('n7', groups['AUTO'])
+        self.assertEqual(groups['ONLY7'], ['DIRECT'], 'emptied group falls back to DIRECT')
+        self.assertEqual(meta['pool_dropped'], ['n7'])
+        self.assertEqual(meta['node_count'], 9)
+        self.assertEqual(meta['source_node_count'], 10)
+        self.assertEqual(meta['source_sha256'],
+                         __import__('hashlib').sha256(self.src.read_bytes()).hexdigest())
+
+    def test_safety_floor_ignores_pool_when_it_would_gut_the_sub(self):
+        meta, doc = self._render([f'n{i}' for i in range(8)] + ['chained'])
+        self.assertTrue(meta['pool_floor_hit'])
+        self.assertEqual(len(doc['proxies']), 10)
+        self.assertEqual(self.out.read_bytes(), self.src.read_bytes())
+
+
+class NodePoolWorkerTests(unittest.TestCase):
+    """End-to-end: worker ticks probe through a fake controller, failures are
+    double-checked, unmanaged nodes are left alone, and a node that stays
+    unreachable is eventually dropped from the subscription."""
 
     def setUp(self):
         self._old_env = {k: os.environ.get(k) for k in (
             'SHARE_GATEWAY_API', 'SHARE_GATEWAY_SECRET',
-            'SHARE_STATE_DIR', 'SHARE_CLASH_DIR')}
+            'SHARE_STATE_DIR', 'SHARE_CLASH_DIR', 'SHARE_SCOPE')}
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         clash = self.root / 'clash'
         state = self.root / 'state'
         (clash / 'airports').mkdir(parents=True)
-        (clash / 'airports' / 'mango-clash.yaml').write_text('proxies: []\n', encoding='utf-8')
+        self.fillers = [f'node-{i}' for i in range(8)]
+        allnodes = self.fillers + ['node-dead', 'node-v6']
+        lines = ['proxies:']
+        for n in allnodes:
+            lines.append(f'- {{name: {n}, type: vless, server: 192.0.2.1, port: 443, udp: true}}')
+        lines += ['proxy-groups:',
+                  '- {name: PROXY, type: select, proxies: [' + ', '.join(allnodes) + ', DIRECT]}',
+                  '- {name: GDEAD, type: select, proxies: [node-dead]}',
+                  'rules:', '- MATCH,PROXY']
+        (clash / 'airports' / 'mango-clash.yaml').write_text('\n'.join(lines) + '\n', encoding='utf-8')
         state.mkdir()
-        (state / 'share-nodes.json').write_text('[]', encoding='utf-8')
-        (state / 'exclude.json').write_text('[]', encoding='utf-8')
         secret = self.root / 'controller-secret'
         secret.write_text('test-secret\n', encoding='utf-8')
         self.gw = _FakeGateway(dead_forever=('node-dead',))
         with self.gw.lock:
-            self.gw.state.update({'node-a': 0, 'node-b': 0, 'node-dead': 0})
+            self.gw.state.update({n: 0 for n in self.fillers + ['node-dead']})
         os.environ['SHARE_STATE_DIR'] = str(state)
         os.environ['SHARE_CLASH_DIR'] = str(clash)
+        os.environ['SHARE_SCOPE'] = 'full'
         os.environ['SHARE_GATEWAY_API'] = f'http://127.0.0.1:{self.gw.port}'
         os.environ['SHARE_GATEWAY_SECRET'] = str(secret)
         import importlib
@@ -2639,18 +2843,7 @@ class GatewayReprobeTests(unittest.TestCase):
         importlib.reload(srv)
         self.srv = srv
 
-    def _wait_round_done(self, timeout=10):
-        """A round sets running=False only after invalidating the cache, so
-        waiting on it also guarantees the next read sees the new verdict."""
-        deadline = time.time() + timeout
-        while self.srv._GATEWAY_PROBE['running'] and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(self.srv._GATEWAY_PROBE['running'], 'probe round never finished')
-
     def tearDown(self):
-        deadline = time.time() + 5
-        while self.srv._GATEWAY_PROBE['running'] and time.time() < deadline:
-            time.sleep(0.02)
         self.gw.close()
         for k, v in self._old_env.items():
             if v is None:
@@ -2659,72 +2852,52 @@ class GatewayReprobeTests(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
-    def test_offline_rows_are_reprobed_and_reachable_ones_revive(self):
-        nodes, err = self.srv.STATE.gateway_nodes()
+    def test_pool_lifecycle_through_the_gateway(self):
+        srv = self.srv
+        self.assertEqual(srv.STATE.gateway_nodes()[0], [], 'no verdicts before the first tick')
+        t = 1_000_000.0
+        srv.pool_tick(now=t)
+        rows, err = srv.STATE.gateway_nodes()
         self.assertEqual(err, '')
-        self.assertEqual({n['name'] for n in nodes}, {'node-a', 'node-b', 'node-dead'})
-        self.assertFalse(any(n['alive'] for n in nodes), 'controller starts all-dead')
-        self.assertTrue(self.gw.done.wait(10),
-                        'background re-probe never hit the delay endpoint')
-        self._wait_round_done()
-        # The probe round invalidated the 15s cache; the next read must reflect
-        # mihomo's corrected verdict - reachable rows online, truly-dead still dead.
-        nodes2, err2 = self.srv.STATE.gateway_nodes()
-        self.assertEqual(err2, '')
-        by = {n['name']: n for n in nodes2}
-        self.assertTrue(by['node-a']['alive'])
-        self.assertTrue(by['node-b']['alive'])
-        self.assertEqual(by['node-a']['delay'], 120)
-        self.assertFalse(by['node-dead']['alive'])
-        self.assertEqual(set(self.gw.attempted), {'node-a', 'node-b', 'node-dead'})
+        by = {r['name']: r for r in rows}
+        self.assertEqual(by['node-0']['status'], 'alive')
+        self.assertEqual(by['node-0']['delay'], 120)
+        self.assertEqual(by['node-dead']['status'], 'suspect')
+        self.assertEqual(by['node-v6']['status'], 'unmanaged')
+        self.assertNotIn('node-v6', self.gw.attempted, 'unmanaged nodes are never probed')
+        self.assertEqual(self.gw.attempted.count('node-dead'), 2, 'a failure is double-checked')
+        blob = json.dumps(rows)
+        self.assertNotIn('192.0.2.1', blob)
+        for _ in range(10):
+            t += 1800
+            srv.pool_tick(now=t)
+        by = {r['name']: r for r in srv.STATE.gateway_nodes()[0]}
+        self.assertEqual(by['node-dead']['status'], 'dead')
+        self.assertEqual(by['node-0']['status'], 'alive')
+        self.assertEqual(by['node-v6']['status'], 'unmanaged')
+        self.assertEqual(rows[0]['status'], 'alive', 'alive rows sort first')
+        out = srv.STATE.paths['out'].read_text(encoding='utf-8')
+        self.assertNotIn('node-dead', out)
+        self.assertIn('node-v6', out)
+        self.assertEqual(srv.STATE.last_meta['pool_dropped'], ['node-dead'])
+        self.assertEqual(srv.STATE.pool.counts()['dead'], 1)
+        # revival: next daily probe succeeds -> back in the subscription
+        self.gw.dead_forever.clear()
+        t += 86400
+        srv.pool_tick(now=t)
+        by = {r['name']: r for r in srv.STATE.gateway_nodes()[0]}
+        self.assertEqual(by['node-dead']['status'], 'suspect')
+        self.assertIn('node-dead', srv.STATE.paths['out'].read_text(encoding='utf-8'))
 
-    def test_recheck_survives_a_later_bulk_sweep(self):
-        # mihomo's next url-test sweep flips the same false negatives back to
-        # delay=0; our recent direct success must keep them online.
-        self.srv.STATE.gateway_nodes()
-        self.assertTrue(self.gw.done.wait(10))
-        self._wait_round_done()
-        with self.gw.lock:
-            self.gw.state.update({'node-a': 0, 'node-b': 0})
-        with self.srv._GATEWAY_CACHE_LOCK:
-            self.srv._GATEWAY_CACHE['ts'] = 0.0
-        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
-        self.assertTrue(by['node-a']['alive'])
-        self.assertEqual(by['node-a']['delay'], 120)
-        self.assertFalse(by['node-dead']['alive'])
-        # and the verdict expires: after the TTL the sweep result shows again
-        with self.srv._GATEWAY_VERDICT_LOCK:
-            for k, (ts, d) in list(self.srv._GATEWAY_VERDICT.items()):
-                self.srv._GATEWAY_VERDICT[k] = (ts - self.srv._GATEWAY_VERDICT_TTL - 1, d)
-        with self.srv._GATEWAY_CACHE_LOCK:
-            self.srv._GATEWAY_CACHE['ts'] = time.time()
-        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
-        self.assertFalse(by['node-a']['alive'])
-
-    def test_sweep_flap_of_a_live_row_is_masked_until_reprobe_fails(self):
-        with self.gw.lock:
-            self.gw.state.update({'node-a': 90})
-        self.srv.STATE.gateway_nodes()                    # observes node-a alive
-        deadline = time.time() + 10
-        while not self.srv._GATEWAY_PROBE['running'] and time.time() < deadline \
-                and len(self.gw.attempted) < 2:
-            time.sleep(0.02)
-        self._wait_round_done()
-        self.assertNotIn('node-a', self.gw.attempted)     # alive rows not probed
-        with self.gw.lock:
-            self.gw.state['node-a'] = 0                   # sweep flap
-        with self.srv._GATEWAY_CACHE_LOCK:
-            self.srv._GATEWAY_CACHE['ts'] = 0.0
-        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
-        self.assertTrue(by['node-a']['alive'], 'recent healthy observation masks the flap')
-        self.assertFalse(by['node-dead']['alive'])
-
-    def test_reprobe_is_throttled_within_the_gap(self):
-        self.srv.STATE.gateway_nodes()
-        self.assertTrue(self.gw.done.wait(10))
-        self._wait_round_done()
-        attempts = list(self.gw.attempted)
-        # A second read must not kick another round inside the 120s gap.
-        self.srv.STATE.gateway_nodes()
-        time.sleep(0.3)
-        self.assertEqual(self.gw.attempted, attempts)
+    def test_gateway_down_reports_error_and_keeps_states(self):
+        srv = self.srv
+        srv.pool_tick(now=1000.0)
+        self.gw.close()
+        srv._POOL_MANAGED['ts'] = 0.0
+        srv.pool_tick(now=5000.0)
+        rows, err = srv.STATE.gateway_nodes()
+        self.assertEqual(err, 'gateway unreachable')
+        by = {r['name']: r for r in rows}
+        self.assertEqual(by['node-0']['status'], 'alive')
+        # reopen a dummy server so tearDown's close() is harmless
+        self.gw = _FakeGateway()

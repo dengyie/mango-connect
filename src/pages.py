@@ -1321,62 +1321,87 @@ def _fmt_time_str(v: Any) -> str:
     return str(v).replace('T', ' ').split('.')[0].split('+')[0]
 
 
-def _delay_cell(delay: Any, alive: bool) -> str:
-    if not alive:
-        return '<span class="delay-dead">离线</span>'
-    if delay is None:
-        return '<span class="delay-dead">未测</span>'
+# Node-pool status -> (label, pill class, delay-cell text when no delay)
+_POOL_STATUS = {
+    'alive': ('可用', 'pill-ok', '未测'),
+    'suspect': ('存疑', 'pill-warn', '探测失败'),
+    'dead': ('死亡', 'pill-off', '不可达'),
+    'pending': ('检测中', 'pill-plain', '检测中'),
+    'unmanaged': ('未纳管', 'pill-plain', '网关未加载'),
+}
+
+
+def _node_status(n: Dict[str, Any]) -> str:
+    st = str(n.get('status') or ('alive' if n.get('alive') else 'dead'))
+    return st if st in _POOL_STATUS else 'pending'
+
+
+def _delay_cell(n: Dict[str, Any]) -> str:
+    st = _node_status(n)
+    delay = n.get('delay')
+    if not isinstance(delay, (int, float)) or st in ('dead', 'pending', 'unmanaged'):
+        text = _POOL_STATUS[st][2]
+        if st == 'suspect' and n.get('fails'):
+            text = f'连续失败 {int(n["fails"])} 次'
+        return f'<span class="delay-dead">{_esc(text)}</span>'
     cls = 'delay-fast' if delay < 200 else ('delay-mid' if delay < 600 else 'delay-slow')
-    return f'<span class="{cls}">{delay} ms</span>'
+    return f'<span class="{cls}">{int(delay)} ms</span>'
 
 
 def _node_card(n: Dict[str, Any]) -> str:
-    alive = bool(n.get('alive'))
+    st = _node_status(n)
+    label, pill, _ = _POOL_STATUS[st]
     delay = n.get('delay')
-    st = ('<span class="pill pill-ok">在线</span>' if alive
-          else '<span class="pill pill-off">离线</span>')
-    if alive and isinstance(delay, (int, float)):
+    if st in ('alive', 'suspect') and isinstance(delay, (int, float)):
         tone = 'lat-fast' if delay < 200 else ('lat-mid' if delay < 600 else 'lat-slow')
         width = max(6.0, min(100.0, delay / 10))
         meter = f'<div class="meter {tone}"><span style="width:{width:.0f}%"></span></div>'
     else:
         meter = '<div class="meter"><span style="width:0"></span></div>'
-    return (f'<article class="node-card{"" if alive else " is-dead"}" data-alive="{1 if alive else 0}" '
+    use = '· 已移出订阅' if st == 'dead' else '· 通过订阅使用'
+    return (f'<article class="node-card{" is-dead" if st == "dead" else ""}" data-status="{st}" '
             f'data-name="{_esc(str(n.get("name") or "").lower())}">'
-            f'<div class="node-top"><span class="node-name">{_esc(n.get("name"))}</span>{st}</div>'
+            f'<div class="node-top"><span class="node-name">{_esc(n.get("name"))}</span>'
+            f'<span class="pill {pill}">{label}</span></div>'
             f'<div class="latency"><div class="latency-row"><span class="faint">延迟</span>'
-            f'{_delay_cell(delay, alive)}</div>{meter}</div>'
+            f'{_delay_cell(n)}</div>{meter}</div>'
             f'<div class="node-meta"><span class="type-badge">{_esc(n.get("type"))}</span>'
-            f'<span>{"UDP" if n.get("udp") else "TCP"}</span><span>· 通过订阅使用</span></div>'
+            f'<span>{"UDP" if n.get("udp") else "TCP"}</span><span>{use}</span></div>'
             f'</article>')
 
 
 def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes',
                role: str = 'user', logout_csrf: str = '',
                aligned: Any = None, aligned_at: str = '') -> str:
-    alive = [n for n in nodes if n['alive'] and n['delay']]
-    avg = (sum(n['delay'] for n in alive) // len(alive)) if alive else 0
-    banner = _notice('warn', f'节点数据暂时不可用：{_esc(error)}（显示的可能是缓存）') if error else ''
+    by = {k: [n for n in nodes if _node_status(n) == k] for k in _POOL_STATUS}
+    timed = [n for n in by['alive'] if isinstance(n.get('delay'), (int, float))]
+    avg = (sum(n['delay'] for n in timed) // len(timed)) if timed else 0
+    banner = _notice('warn', f'节点池暂时无法探测：{_esc(error)}（显示的是最近一次结果）') if error else ''
     if aligned is True:
         when = f'（更新于 {_esc(aligned_at)}）' if aligned_at else ''
         banner += _notice('ok', f'与 3x-ui 已对齐{when}')
     elif aligned is False:
         banner += _notice('warn', '与 3x-ui 未对齐——网关配置有更新尚未传导，'
                                   '等待 10 分钟对齐拉取或手动触发。')
-    health = 'online' if nodes and len(alive) == len(nodes) else (
-        'busy' if alive else 'offline')
+    probed = len(by['alive']) + len(by['suspect']) + len(by['dead'])
+    health = 'online' if probed and len(by['alive']) == probed else (
+        'busy' if by['alive'] else 'offline')
+    health_label = {'online': '全部可用', 'busy': '部分可用', 'offline': '暂无可用'}[health]
     stats = ''.join([
-        _stat('节点总数', f'<span id="st-total">{_counter(len(nodes))}</span>', icon='layers'),
-        _stat('可用', f'<span id="st-alive">{_counter(len(alive))}</span>', icon='check-circle',
-              extra=f'<status-indicator id="st-health" status="{health}" label="{"全部可用" if health == "online" else ("部分可用" if health == "busy" else "暂无可用")}" style="display:block;margin-top:8px"></status-indicator>'),
+        _stat('可用', f'<span id="st-alive">{_counter(len(by["alive"]))}</span>', icon='check-circle',
+              extra=f'<status-indicator id="st-health" status="{health}" label="{health_label}" style="display:block;margin-top:8px"></status-indicator>'),
+        _stat('存疑', f'<span id="st-suspect">{_counter(len(by["suspect"]))}</span>', icon='alert-triangle',
+              note='仍在订阅中，持续复测'),
+        _stat('死亡', f'<span id="st-dead">{_counter(len(by["dead"]))}</span>', icon='circle-x',
+              note='已移出订阅，每天复活检测'),
         _stat('平均延迟', f'<span id="st-avg">{(_counter(avg) + "<small>ms</small>") if avg else "—"}</span>',
-              icon='clock', note='仅统计在线节点'),
+              icon='clock', note=f'可用节点 · 共 <span id="st-total">{len(nodes)}</span> 个'),
     ])
     grid = ''.join(_node_card(n) for n in nodes)
     empty_hidden = ' hidden' if nodes else ''
     body = f"""
-  {_page_head('节点现状', eyebrow='实时探测', eyebrow_icon='activity',
-              lede='数据来自站点网关所在服务器的实时探测（15 秒缓存自动刷新），离线节点会在后台逐个复测；「离线」表示从网关测不通，不代表你本地网络一定不可用。本页只显示名称/协议/延迟，不含服务器地址与凭据。',
+  {_page_head('节点现状', eyebrow='节点池', eyebrow_icon='activity',
+              lede='站点自维护节点池：每个节点都经网关真实链路（含中继）探测。可用节点每 10 分钟测一次，连续失败 3 次转「存疑」；存疑节点每 30 分钟测一次，连续成功 2 次恢复可用、连续失败 10 次判「死亡」并移出订阅；死亡节点每天复测，测通即回到存疑。「未纳管」是网关未加载的节点（如纯 IPv6），不探测也不移除。本页不含服务器地址与凭据。',
               actions=f'<button type="button" class="btn" id="nodes-refresh">{_icon("refresh", 15)}<span class="btn-label">刷新</span></button>')}
   {banner}
   <div class="stats">{stats}</div>
@@ -1384,10 +1409,12 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
     <div class="panel-head">
       <div class="toolbar" style="flex:1">
         <div class="input-icon">{_icon('search', 15)}<input type="search" id="node-filter" placeholder="按名称筛选" aria-label="按名称筛选节点"></div>
-        <div class="chip-row" style="margin:0" role="group" aria-label="在线状态筛选">
+        <div class="chip-row" style="margin:0" role="group" aria-label="节点状态筛选">
           <button type="button" class="chip is-active" data-filter="all">全部</button>
-          <button type="button" class="chip" data-filter="alive">在线</button>
-          <button type="button" class="chip" data-filter="dead">离线</button>
+          <button type="button" class="chip" data-filter="alive">可用</button>
+          <button type="button" class="chip" data-filter="suspect">存疑</button>
+          <button type="button" class="chip" data-filter="dead">死亡</button>
+          <button type="button" class="chip" data-filter="other">未探测</button>
         </div>
       </div>
       <span class="faint" id="nodes-updated">已加载</span>
@@ -1403,31 +1430,42 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
     var grid=document.getElementById('nodes-grid'),empty=document.getElementById('nodes-empty');
     var q=document.getElementById('node-filter'),upd=document.getElementById('nodes-updated');
     var mode='all';
+    var ST={alive:['可用','pill-ok','未测'],suspect:['存疑','pill-warn','探测失败'],dead:['死亡','pill-off','不可达'],
+      pending:['检测中','pill-plain','检测中'],unmanaged:['未纳管','pill-plain','网关未加载']};
     function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+    function status(n){var s=n.status||(n.alive?'alive':'dead');return ST[s]?s:'pending';}
+    function timed(n){var s=status(n);return (s==='alive'||s==='suspect')&&typeof n.delay==='number';}
     function delayHtml(n){
-      if(!n.alive)return '<span class="delay-dead">离线</span>';
-      if(n.delay==null)return '<span class="delay-dead">未测</span>';
+      var s=status(n);
+      if(!timed(n)){var t=(s==='suspect'&&n.fails)?('连续失败 '+n.fails+' 次'):ST[s][2];
+        return '<span class="delay-dead">'+esc(t)+'</span>';}
       var c=n.delay<200?'delay-fast':(n.delay<600?'delay-mid':'delay-slow');
       return '<span class="'+c+'">'+n.delay+' ms</span>';
     }
     function meter(n){
-      if(!n.alive||typeof n.delay!=='number')return '<div class="meter"><span style="width:0"></span></div>';
+      if(!timed(n))return '<div class="meter"><span style="width:0"></span></div>';
       var t=n.delay<200?'lat-fast':(n.delay<600?'lat-mid':'lat-slow');
       return '<div class="meter '+t+'"><span style="width:'+Math.max(6,Math.min(100,n.delay/10)).toFixed(0)+'%"></span></div>';
     }
     function card(n){
-      return '<article class="node-card'+(n.alive?'':' is-dead')+'" data-alive="'+(n.alive?1:0)+'" data-name="'+esc(String(n.name||'').toLowerCase())+'">'
+      var s=status(n);
+      return '<article class="node-card'+(s==='dead'?' is-dead':'')+'" data-status="'+s+'" data-name="'+esc(String(n.name||'').toLowerCase())+'">'
         +'<div class="node-top"><span class="node-name">'+esc(n.name)+'</span>'
-        +(n.alive?'<span class="pill pill-ok">在线</span>':'<span class="pill pill-off">离线</span>')+'</div>'
+        +'<span class="pill '+ST[s][1]+'">'+ST[s][0]+'</span></div>'
         +'<div class="latency"><div class="latency-row"><span class="faint">延迟</span>'+delayHtml(n)+'</div>'+meter(n)+'</div>'
-        +'<div class="node-meta"><span class="type-badge">'+esc(n.type)+'</span><span>'+(n.udp?'UDP':'TCP')+'</span><span>· 通过订阅使用</span></div></article>';
+        +'<div class="node-meta"><span class="type-badge">'+esc(n.type)+'</span><span>'+(n.udp?'UDP':'TCP')+'</span><span>'
+        +(s==='dead'?'· 已移出订阅':'· 通过订阅使用')+'</span></div></article>';
+    }
+    function match(st){
+      if(mode==='all')return true;
+      if(mode==='other')return st==='pending'||st==='unmanaged';
+      return st===mode;
     }
     function applyFilter(){
       if(!grid)return;var term=(q&&q.value||'').trim().toLowerCase(),shown=0;
       grid.querySelectorAll('.node-card').forEach(function(el){
-        var ok=(mode==='all'||(mode==='alive'?el.dataset.alive==='1':el.dataset.alive==='0'))
-          &&(!term||el.dataset.name.indexOf(term)!==-1);
+        var ok=match(el.dataset.status)&&(!term||el.dataset.name.indexOf(term)!==-1);
         el.hidden=!ok;if(ok)shown++;});
       if(empty)empty.hidden=shown>0;
     }
@@ -1435,11 +1473,13 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
       el.innerHTML=v?(String(v)+(suf?'<small>'+suf+'</small>':'')):'—';}
     function render(nodes){
       if(!grid)return;grid.innerHTML=nodes.map(card).join('');
-      var alive=nodes.filter(function(n){return n.alive&&n.delay;});
-      var avg=alive.length?Math.floor(alive.reduce(function(a,n){return a+n.delay;},0)/alive.length):0;
-      setNum('st-total',nodes.length||'0');setNum('st-alive',alive.length||'0');setNum('st-avg',avg,'ms');
-      var h=document.getElementById('st-health');
-      if(h){var st=nodes.length&&alive.length===nodes.length?'online':(alive.length?'busy':'offline');
+      var c={alive:0,suspect:0,dead:0};nodes.forEach(function(n){var s=status(n);if(s in c)c[s]++;});
+      var live=nodes.filter(function(n){return status(n)==='alive'&&typeof n.delay==='number';});
+      var avg=live.length?Math.floor(live.reduce(function(a,n){return a+n.delay;},0)/live.length):0;
+      setNum('st-alive',c.alive||'0');setNum('st-suspect',c.suspect||'0');setNum('st-dead',c.dead||'0');
+      setNum('st-avg',avg,'ms');var tt=document.getElementById('st-total');if(tt)tt.textContent=nodes.length;
+      var h=document.getElementById('st-health'),probed=c.alive+c.suspect+c.dead;
+      if(h){var st=probed&&c.alive===probed?'online':(c.alive?'busy':'offline');
         h.setAttribute('label',st==='online'?'全部可用':(st==='busy'?'部分可用':'暂无可用'));h.setAttribute('status',st);}
       applyFilter();
     }
@@ -1448,7 +1488,7 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
       return fetch('/nodes/api',{credentials:'same-origin'})
         .then(function(r){return r.json();})
         .then(function(d){if(d&&d.ok){render(d.nodes||[]);stamp();if(manual)uiToast('节点状态已刷新','success');}
-          else if(manual)uiToast('节点数据暂时不可用','warning');})
+          else if(manual)uiToast('节点池暂时不可用','warning');})
         .catch(function(){if(manual)uiToast('刷新失败，请稍后重试','error');});
     }
     var b=document.getElementById('nodes-refresh');
@@ -1480,12 +1520,13 @@ _DOC_SECTIONS: Sequence[Tuple[str, str, Sequence[Tuple[str, str]]]] = (
         ('token /sub/<token>', '长期订阅凭据：SHA-256 存储、show-once 展示、重置即失效。'),
     )),
     ('align', '对齐机制（与 3x-ui）', (
-        ('字节镜像', 'full 模式 /sub 输出 = gateway 客户端导出逐字节复制（mixed-port/tun/dns 与站长自用一致）。'),
+        ('字节镜像', 'full 模式 /sub 输出 = gateway 客户端导出逐字节复制（mixed-port/tun/dns 与站长自用一致）；仅在节点池有死亡节点时去掉这些节点及其策略组成员。'),
         ('10 分钟对齐拉取', 'cron 触发 gateway /sub/clash 重生成（指纹不变秒回），面板改节点/规则后 ≤10 分钟自动传导。'),
         ('边界', 'rules-reconciler 的 user-rules 只进网关运行时，不进客户端导出（站长自用设备同样如此）。'),
     )),
     ('status', '节点状态数据', (
-        ('/nodes/api', '网关 mihomo controller /proxies 归一化（15 秒缓存），只含名称/协议/延迟/存活，永不含 server 地址与凭据。'),
+        ('/nodes/api', '站点自维护节点池（可用/存疑/死亡/未纳管），经网关 controller 逐节点真实链路探测；死亡节点自动移出订阅。只含名称/协议/延迟/状态，永不含 server 地址与凭据。'),
+        ('节点池状态机', '可用 10 分钟/次，连续 3 次失败→存疑；存疑 30 分钟/次，连续 2 次成功→可用，连续 10 次失败→死亡；死亡每天复测，成功→存疑。失败需两次尝试确认，网关侧故障触发熔断不计数；剔除后少于 25% 时不剔除。'),
         ('对齐徽章', '与 3x-ui 对齐状态 = 本站输出 sha256 与 gateway mango-clash.meta.json 比对。'),
     )),
     ('ops', '运维端点', (
