@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -170,12 +172,48 @@ def last_used_map(path: Path) -> Dict[str, int]:
     return latest
 
 
+def derive_token(secret: bytes, nonce: str) -> str:
+    """Account-bound subscription token: HMAC(secret.key, nonce). Only the
+    SHA-256 and the (non-secret) nonce are stored, yet the server can show
+    the owner their link again on the dashboard. Anyone holding secret.key
+    can already forge sessions and export links, so this adds no new
+    exposure; rotating secret.key invalidates the derivation (the hash check
+    in recover_token then hides the link instead of showing a wrong one)."""
+    mac = hmac.new(secret, b'mango-sub-token|v1|' + nonce.encode('ascii'),
+                   hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac[:24]).decode('ascii')
+
+
+def recover_token(secret: bytes, rec: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Plaintext of a derived, unrevoked token record; None for legacy random
+    tokens (never persisted, cannot be shown again) or on any mismatch."""
+    if not rec or rec.get('revoked'):
+        return None
+    nonce = str(rec.get('derive_nonce') or '')
+    if not nonce:
+        return None
+    token = derive_token(secret, nonce)
+    if not secrets.compare_digest(_hash(token), str(rec.get('token_sha256') or '')):
+        return None
+    return token
+
+
+def find_by_id(path: Path, token_id: str) -> Optional[Dict[str, Any]]:
+    for r in load(path):
+        if str(r.get('id') or '') == str(token_id or ''):
+            return r
+    return None
+
+
 def create_token(path: Path, name: str, owner: str = '',
-                 now: Optional[int] = None) -> tuple[Dict[str, Any], str]:
+                 now: Optional[int] = None,
+                 secret: Optional[bytes] = None) -> tuple[Dict[str, Any], str]:
     """Create a token record and return (record, plaintext). The plaintext is
-    shown once at creation and never persisted; `owner` optionally links the
-    token to a users.json account id (None/'' = legacy anonymous token)."""
-    token = secrets.token_urlsafe(24)
+    never persisted; `owner` optionally links the token to a users.json
+    account id (None/'' = legacy anonymous token). With `secret`, the token
+    is derived from it (see derive_token) so its owner can view it again."""
+    nonce = secrets.token_hex(16) if secret else ''
+    token = derive_token(secret, nonce) if secret else secrets.token_urlsafe(24)
     with _locked(path):
         records = load(path)
         rec = {
@@ -186,6 +224,8 @@ def create_token(path: Path, name: str, owner: str = '',
             'last_used': None,
             'revoked': False,
         }
+        if nonce:
+            rec['derive_nonce'] = nonce
         if owner:
             rec['owner'] = str(owner)
         ids = {r.get('id') for r in records}

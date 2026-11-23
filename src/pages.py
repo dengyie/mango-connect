@@ -1081,7 +1081,8 @@ def _next_reset(reset_day: int) -> str:
 
 
 def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
-                   masked_url: str = '', node_count: int = 0, last_used: int = 0,
+                   masked_url: str = '', sub_url: str = '',
+                   node_count: int = 0, last_used: int = 0,
                    export_url: str = '', msg: str = '', err: str = '') -> str:
     quota = int(user.get('quota_bytes') or 0)
     used = int(user.get('used_bytes') or 0)
@@ -1138,6 +1139,18 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
         _stat('分享节点', _counter(node_count, ' 个'), icon='globe',
               note=f'最后拉取 {_esc(_fmt_ts(int(last_used)))}'),
     ])
+    if sub_url:
+        sub_block = f"""<p class="muted">在客户端里手动添加此链接即可；请勿外传，泄露后点下方重置。</p>
+          <div class="copy-field">
+            <label class="visually-hidden" for="sub-url">订阅链接</label>
+            <input type="text" id="sub-url" readonly value="{_esc(sub_url)}" spellcheck="false">
+            <button type="button" class="btn btn-primary" data-copy-target="sub-url" data-copy-toast="订阅链接已复制">{_icon('copy', 15)}<span class="btn-label">复制</span></button>
+          </div>
+          <p class="faint">重置后旧链接与旧导入地址立即失效，新链接会显示在这里。</p>"""
+    else:
+        sub_block = ('<p class="muted">当前链接生成于旧版本，无法再次显示。'
+                     '点「重置订阅链接」生成新链接，之后可随时在这里查看和复制；'
+                     '旧链接与旧导入地址会立即失效。</p>')
     body = f"""
   {head}
   {banner}
@@ -1170,7 +1183,7 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
         <summary><span>订阅链接如何生效</span>{_icon('chevron-down', 15)}</summary>
         <div class="disclosure-body">
           <p>一键导入地址长期有效（30 天窗口，每次登录自动续期）；重置订阅链接会立即使旧地址失效，届时请重新登录导入。</p>
-          <p>完整订阅链接只在生成或重置时展示一次（凭证不落库，仅存 SHA-256）；客户端里已导入的链接继续有效。给新设备配置：点「重置订阅链接」获取完整链接，旧链接随即失效。</p>
+          <p>完整订阅链接可随时在右侧「订阅链接」卡片查看和复制（仅本人登录可见）；泄露后点「重置订阅链接」，旧链接随即失效。</p>
           <p>用量由自建节点侧上报累计；第三方机场节点（如有）不受配额约束。</p>
         </div>
       </details>
@@ -1179,7 +1192,7 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
       <section class="panel">
         <div class="panel-head"><h2>{_icon('key', 16)}订阅链接</h2></div>
         <div class="panel-body">
-          <p class="muted">需要给新设备手动添加？重置后会展示一次完整链接，旧链接与旧导入地址立即失效。</p>
+          {sub_block}
           <form method="post" action="/dashboard/regen-token" class="form-actions" onsubmit="return confirm('重置后旧订阅链接立即失效，确认继续？')">
             <input type="hidden" name="csrf" value="{_esc(csrf)}">
             <button type="submit" class="btn btn-danger">{_icon('refresh', 15)}重置订阅链接</button>
@@ -1214,13 +1227,13 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
 def reveal_page(url: str, *, back: str = '/dashboard',
                 title_note: str = '', role: str = 'user',
                 logout_csrf: str = '') -> str:
-    """One-time display of a freshly minted subscription URL (plaintext is
-    never persisted; this response is the only reveal)."""
+    """Display of a freshly minted subscription URL. The plaintext is never
+    persisted; the owner can re-view it on the dashboard (derived token)."""
     note = f'<span class="pill pill-plain">{_esc(title_note)}</span>' if title_note else ''
     body = f"""
-  {_page_head('订阅链接已生成', eyebrow='一次性展示', eyebrow_icon='eye',
+  {_page_head('订阅链接已生成', eyebrow='新链接', eyebrow_icon='eye',
               actions=f'<a class="btn" href="{_esc(back)}">{_icon("arrow-right", 15)}返回</a>')}
-  {_notice('warn', '完整订阅链接<b>仅展示这一次</b>，请立即复制保存；关闭页面后无法再次查看（凭证仅存 SHA-256）。')}
+  {_notice('warn', '新订阅链接已生成，旧链接已失效。请复制保存；之后也可登录用户中心，在「订阅链接」里随时查看。')}
   <section class="panel">
     <div class="panel-head"><h2>{_icon('key', 16)}完整链接</h2>{note}</div>
     <div class="section">

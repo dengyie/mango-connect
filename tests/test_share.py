@@ -1088,7 +1088,7 @@ class AccountHarness(unittest.TestCase):
         status, _, body = self._req('/admin/users', data=data.encode(),
                                     headers=self._auth(admin_ck))
         self.assertEqual(status, 200)
-        self.assertIn('仅展示这一次', body.decode())
+        self.assertIn('新订阅链接已生成', body.decode())
         import re
         m = re.search(rb'/sub/([A-Za-z0-9_-]+)', body)
         self.assertTrue(m, 'reveal page must show the full URL once')
@@ -1257,7 +1257,7 @@ class AccountHttpTests(AccountHarness):
             data=f'csrf={csrf}&action=regen-token&value='.encode(),
             headers=self._auth(ck))
         self.assertEqual(status, 200)
-        self.assertIn('仅展示这一次', body.decode())
+        self.assertIn('新订阅链接已生成', body.decode())
         import re
         new_token = re.search(rb'/sub/([A-Za-z0-9_-]+)', body).group(1).decode()
         self.assertNotEqual(new_token, old_token)
@@ -1275,6 +1275,41 @@ class AccountHttpTests(AccountHarness):
         admin = self.us.find_by_username(self.us.load(self.us.users_file()), 'admin1')
         self.assertTrue(admin['token_id'],
                         'dashboard regen binds a token to the logged-in user')
+
+    def test_dashboard_shows_and_resets_sub_link(self):
+        import re
+        ck, csrf = self._login()
+        # admin-created user: the derived link is visible on their dashboard
+        token = self._create_demo_user(ck, csrf)
+        uck, ucsrf = self._login('demo1', 'demopass123')
+        status, _, body = self._req('/dashboard', headers=self._auth(uck))
+        self.assertEqual(status, 200)
+        self.assertIn(f'/sub/{token}', body.decode())
+        # reset: old link dies, new link is shown on the dashboard
+        status, _, body = self._req('/dashboard/regen-token',
+                                    data=f'csrf={ucsrf}'.encode(),
+                                    headers=self._auth(uck))
+        self.assertEqual(status, 200)
+        new = re.search(rb'/sub/([A-Za-z0-9_-]+)', body).group(1).decode()
+        self.assertNotEqual(new, token)
+        self.assertEqual(self._req(f'/sub/{token}')[0], 401)
+        self.assertEqual(self._req(f'/sub/{new}')[0], 200)
+        _, _, body = self._req('/dashboard', headers=self._auth(uck))
+        self.assertIn(f'/sub/{new}', body.decode())
+        self.assertNotIn(f'/sub/{token}', body.decode())
+
+    def test_dashboard_legacy_token_not_shown(self):
+        ck, csrf = self._login()
+        self._create_demo_user(ck, csrf)
+        # simulate a pre-derivation random token
+        recs = tk.load(tk.token_file())
+        for r in recs:
+            r.pop('derive_nonce', None)
+        tk.save(tk.token_file(), recs)
+        uck, _ = self._login('demo1', 'demopass123')
+        _, _, body = self._req('/dashboard', headers=self._auth(uck))
+        self.assertIn('无法再次显示', body.decode())
+        self.assertNotIn('id="sub-url"', body.decode())
 
     def test_ingest_endpoint(self):
         _, node_token = tk.create_token(tk.nodes_file(), 'node-a')

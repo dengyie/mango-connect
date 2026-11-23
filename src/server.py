@@ -747,6 +747,16 @@ class Handler(BaseHTTPRequestHandler):
             pass
         masked = f'{pages.public_host()}/sub/<你的专属令牌>'
         export_url = self._export_url(fresh)
+        sub_url = ''
+        try:
+            plain = token_store.recover_token(
+                users.load_secret(),
+                token_store.find_by_id(token_store.token_file(),
+                                       str(fresh.get('token_id') or '')))
+            if plain:
+                sub_url = f'{pages.public_host()}/sub/{plain}'
+        except Exception:
+            pass
         last_used = 0
         try:
             last_map = token_store.last_used_map(token_store.token_file())
@@ -755,7 +765,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         html_body = pages.dashboard_page(
             fresh, tok, status_reason='' if ok else reason,
-            masked_url=masked, node_count=count, last_used=last_used,
+            masked_url=masked, sub_url=sub_url, node_count=count, last_used=last_used,
             export_url=f'{pages.public_host()}{export_url}', msg=msg, err=err)
         headers = self._page_headers(self._slide_session_cookie(fresh) or setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8', headers=headers)
@@ -938,7 +948,8 @@ class Handler(BaseHTTPRequestHandler):
                 if old_id:
                     token_store.revoke_by_id(tokens_path, old_id)
             rec, plaintext = token_store.create_token(
-                tokens_path, user['username'], owner=str(user['id']))
+                tokens_path, user['username'], owner=str(user['id']),
+                secret=users.load_secret())
             if target is not None:
                 target['token_id'] = rec['id']
                 users.save(users.users_file(), records)
@@ -996,7 +1007,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         user_id = rec['id']
         rec, plaintext = token_store.create_token(token_store.token_file(),
-                                                  rec['username'], owner=rec['id'])
+                                                  rec['username'], owner=rec['id'],
+                                                  secret=users.load_secret())
         users.update_user(users.users_file(), user_id,
                           lambda r: r.update(token_id=rec['id']))
         self._audit(admin['username'], 'user.create', target=username,
