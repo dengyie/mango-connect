@@ -739,7 +739,7 @@ button.chip{font:inherit;font-size:12.5px;font-weight:600;cursor:pointer}
 .endpoint{display:grid;grid-template-columns:minmax(180px,260px) minmax(0,1fr);gap:6px 20px;padding:14px 24px}
 .endpoint+.endpoint{border-top:1px dashed var(--line)}
 .endpoint code{align-self:start;justify-self:start;background:var(--sunken)}
-.endpoint p{color:var(--ink-2);font-size:13px;line-height:1.7}
+.endpoint p{color:var(--ink-2);font-size:13px;line-height:1.7;overflow-wrap:anywhere}
 @media (max-width:900px){.docs-layout{grid-template-columns:minmax(0,1fr)}.toc{display:none}}
 @media (max-width:640px){.endpoint{grid-template-columns:minmax(0,1fr)}}
 

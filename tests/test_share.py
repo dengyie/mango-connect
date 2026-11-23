@@ -2349,6 +2349,16 @@ class Review8Tests(AccountHarness):
         self.assertIn('overflow-x:auto', rule.group(1))
         self.assertIn('position:relative', rule.group(1))
 
+    def test_endpoint_text_wraps_long_ascii_runs(self):
+        # Docs endpoint descriptions contain long slash-joined protocol lists
+        # with no break opportunity; they must wrap instead of widening the
+        # page on 360px phones.
+        import re as _re
+        import pages
+        rule = _re.search(r'\.endpoint p\{([^}]*)\}', pages._CSS)
+        self.assertIsNotNone(rule)
+        self.assertIn('overflow-wrap:anywhere', rule.group(1))
+
     def test_fresh_install_without_optional_inputs_renders(self):
         # share-nodes.json / exclude.json are optional in full scope: a fresh
         # install (README quick start) must not 500 every subscription.
