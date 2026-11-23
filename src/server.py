@@ -137,8 +137,12 @@ class ShareState:
         API does not expose addresses). 15s cache; stale cache on failure."""
         now = time.time()
         with _GATEWAY_CACHE_LOCK:
-            if now - float(_GATEWAY_CACHE['ts']) < 15 and _GATEWAY_CACHE['nodes']:
-                return list(_GATEWAY_CACHE['nodes']), ''
+            cached = (list(_GATEWAY_CACHE['nodes'])
+                      if now - float(_GATEWAY_CACHE['ts']) < 15
+                      and _GATEWAY_CACHE['nodes'] else [])
+        if cached:
+            _schedule_reprobe(cached)
+            return cached, ''
         import urllib.request
         nodes: list = []
         err = ''
@@ -158,6 +162,7 @@ class ShareState:
             _GATEWAY_CACHE.update(ts=now, nodes=nodes)
         if not nodes and not _GATEWAY_CACHE['nodes']:
             return [], err
+        _schedule_reprobe(list(nodes))
         return list(nodes), err
 
     def ensure_fresh(self) -> dict:
@@ -194,6 +199,91 @@ _GATEWAY_GROUP_TYPES = {'selector', 'urltest', 'fallback', 'loadbalance',
                         'compatible', 'pass', 'passrule', 'dns'}
 _GATEWAY_CACHE: Dict[str, Any] = {'ts': 0.0, 'nodes': []}
 _GATEWAY_CACHE_LOCK = threading.Lock()
+# Health-check misfires: mihomo runs url-test/fallback group probes lazily
+# (~5min) and, at 100+ nodes, one bulk sweep marks reachable nodes dead
+# (per-probe timeout under load); fallback groups stop after the first
+# survivor, so a member can carry a days-old verdict. The status page would
+# then show live nodes as 离线. We re-test the offline rows through the
+# controller's own delay API in the background (a success also rewrites
+# mihomo's history, replacing the stale sweep), throttled and batched.
+_GATEWAY_PROBE_URL = 'http://www.gstatic.com/generate_204'
+_GATEWAY_PROBE_TIMEOUT_MS = 3000
+_GATEWAY_PROBE_WORKERS = 5
+_GATEWAY_PROBE_GAP = 120        # min seconds between background rounds
+_GATEWAY_PROBE_BATCH = 40       # rows re-tested per round (stalest first)
+_GATEWAY_PROBE_LOCK = threading.Lock()
+_GATEWAY_PROBE: Dict[str, Any] = {'running': False, 'last': 0.0}
+
+
+def _gateway_secret() -> str:
+    return Path(_GATEWAY_SECRET_FILE).read_text(encoding='utf-8').strip()
+
+
+def _probe_delay(name: str, secret: str):
+    """Live delay for one node via the controller. A success also rewrites
+    mihomo's own history entry, so the bogus bulk-sweep verdict is replaced
+    everywhere, not just in our cache."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    q = urllib.parse.quote(name, safe='')
+    url = (_GATEWAY_API.rstrip('/') + '/proxies/' + q + '/delay'
+           '?timeout=%d&url=%s'
+           % (_GATEWAY_PROBE_TIMEOUT_MS,
+              urllib.parse.quote(_GATEWAY_PROBE_URL, safe='')))
+    req = urllib.request.Request(
+        url, headers={'Authorization': 'Bearer ' + secret,
+                      'User-Agent': 'mango-share/1'})
+    try:
+        with urllib.request.urlopen(
+                req, timeout=_GATEWAY_PROBE_TIMEOUT_MS / 1000 + 3) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+        delay = data.get('delay')
+        return int(delay) if isinstance(delay, int) and delay > 0 else None
+    except urllib.error.HTTPError as e:
+        e.close()  # 504 on timeout / 503 on failure still carries a body
+        return None
+    except Exception:
+        return None
+
+
+def _probe_round(names: list) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        secret = _gateway_secret()
+        if secret:
+            with ThreadPoolExecutor(max_workers=_GATEWAY_PROBE_WORKERS) as pool:
+                list(pool.map(lambda n: _probe_delay(n, secret), names))
+    except Exception:
+        pass
+    finally:
+        # Re-probing rewrote mihomo's history for the reachable ones; expire
+        # the 15s cache so the next read shows the corrected verdict.
+        with _GATEWAY_CACHE_LOCK:
+            _GATEWAY_CACHE['ts'] = 0.0
+        with _GATEWAY_PROBE_LOCK:
+            _GATEWAY_PROBE['running'] = False
+
+
+def _schedule_reprobe(nodes: list) -> None:
+    """Kick a throttled background re-test of rows currently shown offline."""
+    dead = [n for n in nodes if not n.get('alive')]
+    if not dead:
+        return
+    now = time.time()
+    with _GATEWAY_PROBE_LOCK:
+        if (_GATEWAY_PROBE['running']
+                or now - float(_GATEWAY_PROBE['last']) < _GATEWAY_PROBE_GAP):
+            return
+        _GATEWAY_PROBE['running'] = True
+        _GATEWAY_PROBE['last'] = now
+    # Stalest first so a capped batch still rotates through every dead row
+    # (truly-dead nodes would otherwise monopolise each round forever).
+    dead.sort(key=lambda n: (n.get('checkedAt') is not None,
+                             n.get('checkedAt') or ''))
+    names = [n['name'] for n in dead[:_GATEWAY_PROBE_BATCH]]
+    threading.Thread(target=_probe_round, args=(names,), daemon=True).start()
+
 # Landing-page region badges, keyed by the rendered output's sha256.
 _REGIONS_CACHE: Dict[str, Any] = {'sha': '', 'regions': []}
 _REGIONS_CACHE_LOCK = threading.Lock()
@@ -746,8 +836,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         masked = f'{pages.public_host()}/sub/<你的专属令牌>'
+        sub_url, sub_kind = '', 'token'
+        if not fresh.get('token_id'):
+            # Account never had a subscription token (e.g. CLI-created admin):
+            # mint one now - nothing to break, and a logged-in user must
+            # always see their own yml link.
+            try:
+                fresh = self._provision_user_token(fresh)
+            except Exception as e:
+                sys.stderr.write('mango-share ERROR token provisioning failed for %s: %r\n'
+                                 % (fresh.get('username'), e))
+        # after provisioning: the export signature binds the current token_id
         export_url = self._export_url(fresh)
-        sub_url = ''
         try:
             plain = token_store.recover_token(
                 users.load_secret(),
@@ -757,6 +857,11 @@ class Handler(BaseHTTPRequestHandler):
                 sub_url = f'{pages.public_host()}/sub/{plain}'
         except Exception:
             pass
+        if not sub_url:
+            # Legacy random token: its plaintext was never stored. Show the
+            # signed per-account yml link instead of forcing a reset that
+            # would break clients already holding the old link.
+            sub_url, sub_kind = f'{pages.public_host()}{export_url}', 'export'
         last_used = 0
         try:
             last_map = token_store.last_used_map(token_store.token_file())
@@ -765,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         html_body = pages.dashboard_page(
             fresh, tok, status_reason='' if ok else reason,
-            masked_url=masked, sub_url=sub_url, node_count=count, last_used=last_used,
+            masked_url=masked, sub_url=sub_url, sub_kind=sub_kind, node_count=count, last_used=last_used,
             export_url=f'{pages.public_host()}{export_url}', msg=msg, err=err)
         headers = self._page_headers(self._slide_session_cookie(fresh) or setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8', headers=headers)
@@ -931,6 +1036,28 @@ class Handler(BaseHTTPRequestHandler):
                                  logout_csrf=self._field(form, 'csrf')).encode('utf-8')
         self._send(200, body, ctype='text/html; charset=utf-8',
                    headers=[('Cache-Control', 'no-store'), *_html_security_headers()])
+
+    def _provision_user_token(self, user: dict) -> dict:
+        """Give a token-less account its first (derived) subscription token.
+        Re-checked inside the users-store lock so concurrent dashboard loads
+        mint at most one. Returns the fresh user record."""
+        minted = False
+        with users.locked(users.users_file()):
+            records = users.load(users.users_file())
+            target = users.find_by_id(records, user['id'])
+            if target is None:
+                return user
+            if not target.get('token_id'):
+                rec, _ = token_store.create_token(
+                    token_store.token_file(), target['username'],
+                    owner=str(target['id']), secret=users.load_secret())
+                target['token_id'] = rec['id']
+                users.save(users.users_file(), records)
+                minted = True
+            fresh = dict(target)
+        if minted:
+            self._audit(user['username'], 'token.provision', target=user['username'])
+        return fresh
 
     def _rotate_user_token(self, user: dict) -> str:
         """Revoke the user's old subscription token and mint a new one;

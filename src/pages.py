@@ -1081,7 +1081,7 @@ def _next_reset(reset_day: int) -> str:
 
 
 def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
-                   masked_url: str = '', sub_url: str = '',
+                   masked_url: str = '', sub_url: str = '', sub_kind: str = 'token',
                    node_count: int = 0, last_used: int = 0,
                    export_url: str = '', msg: str = '', err: str = '') -> str:
     quota = int(user.get('quota_bytes') or 0)
@@ -1139,18 +1139,18 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
         _stat('分享节点', _counter(node_count, ' 个'), icon='globe',
               note=f'最后拉取 {_esc(_fmt_ts(int(last_used)))}'),
     ])
-    if sub_url:
-        sub_block = f"""<p class="muted">在客户端里手动添加此链接即可；请勿外传，泄露后点下方重置。</p>
+    if sub_kind == 'export':
+        sub_note = ('<p class="faint">当前账号使用旧版令牌，此为账号签名 yml 链接（30 天有效，每次登录自动续期）。'
+                    '点「重置订阅链接」可换成长期固定链接；重置后旧链接与旧导入地址立即失效。</p>')
+    else:
+        sub_note = '<p class="faint">长期有效，客户端会按此地址自动更新。泄露后点下方重置，旧链接与旧导入地址立即失效，新链接会显示在这里。</p>'
+    sub_block = f"""<p class="muted">你的专属 yml 订阅链接，在客户端里添加即可；请勿外传。</p>
           <div class="copy-field">
             <label class="visually-hidden" for="sub-url">订阅链接</label>
             <input type="text" id="sub-url" readonly value="{_esc(sub_url)}" spellcheck="false">
             <button type="button" class="btn btn-primary" data-copy-target="sub-url" data-copy-toast="订阅链接已复制">{_icon('copy', 15)}<span class="btn-label">复制</span></button>
           </div>
-          <p class="faint">重置后旧链接与旧导入地址立即失效，新链接会显示在这里。</p>"""
-    else:
-        sub_block = ('<p class="muted">当前链接生成于旧版本，无法再次显示。'
-                     '点「重置订阅链接」生成新链接，之后可随时在这里查看和复制；'
-                     '旧链接与旧导入地址会立即失效。</p>')
+          {sub_note}""" if sub_url else ''
     body = f"""
   {head}
   {banner}

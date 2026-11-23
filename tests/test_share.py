@@ -1308,8 +1308,27 @@ class AccountHttpTests(AccountHarness):
         tk.save(tk.token_file(), recs)
         uck, _ = self._login('demo1', 'demopass123')
         _, _, body = self._req('/dashboard', headers=self._auth(uck))
-        self.assertIn('无法再次显示', body.decode())
-        self.assertNotIn('id="sub-url"', body.decode())
+        html = body.decode()
+        self.assertIn('id="sub-url"', html)   # still gets a yml link
+        self.assertIn('旧版令牌', html)
+        import re, html as _h
+        url = _h.unescape(re.search(r'id="sub-url" readonly value="([^"]+)"', html).group(1))
+        path = url.split('://', 1)[-1].split('/', 1)[1]
+        self.assertTrue(path.startswith('sub/export?'))
+        self.assertEqual(self._req('/' + path)[0], 200)
+
+    def test_dashboard_provisions_token_for_tokenless_account(self):
+        import re, html as _h
+        ck, _ = self._login()   # admin1 has no token yet
+        self.assertFalse(self.us.find_by_username(
+            self.us.load(self.us.users_file()), 'admin1').get('token_id'))
+        _, _, body = self._req('/dashboard', headers=self._auth(ck))
+        html = body.decode()
+        m = re.search(r'id="sub-url" readonly value="[^"]*/sub/([A-Za-z0-9_-]+)"', html)
+        self.assertTrue(m, 'token-less account gets a derived link on first visit')
+        self.assertEqual(self._req(f'/sub/{m.group(1)}')[0], 200)
+        _, _, body2 = self._req('/dashboard', headers=self._auth(ck))
+        self.assertIn(f'/sub/{m.group(1)}', body2.decode(), 'stable across visits')
 
     def test_ingest_endpoint(self):
         _, node_token = tk.create_token(tk.nodes_file(), 'node-a')
@@ -2141,3 +2160,157 @@ class Review7Tests(AccountHarness):
         import state_backup as sb
         out = sb.pack(dict(os.environ), Path(self.tmp.name) / 'out/pack.tar.gz')
         self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+
+class _FakeGateway:
+    """Minimal mihomo controller: /proxies mirrors a mutable alive table and
+    /proxies/<name>/delay rewrites it exactly like mihomo's URLTest (a success
+    sets alive + a positive history delay; a failure records delay 0)."""
+
+    def __init__(self, dead_forever=()):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.state = {}                # name -> last delay (0 == dead)
+        self.dead_forever = set(dead_forever)
+        self.lock = threading.Lock()
+        self.attempted = []            # names whose delay endpoint was hit
+        self.done = threading.Event()
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, code, body):
+                payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                from urllib.parse import unquote, urlsplit
+                parts = [unquote(p) for p in urlsplit(self.path).path.strip('/').split('/')]
+                if parts == ['proxies']:
+                    return self._json(200, {'proxies': outer._payload()})
+                if len(parts) == 3 and parts[0] == 'proxies' and parts[2] == 'delay':
+                    return outer._delay(self, parts[1])
+                return self._json(404, {'message': 'not found'})
+
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def _payload(self):
+        with self.lock:
+            items = {'PROXY': {'type': 'Selector', 'history': []}}
+            for name, delay in self.state.items():
+                items[name] = {'type': 'Vless', 'udp': True, 'alive': delay > 0,
+                               'history': [{'time': '2026-11-23T00:00:00',
+                                            'delay': delay}]}
+            return items
+
+    def _delay(self, handler, name):
+        with self.lock:
+            if name in self.state:
+                self.attempted.append(name)
+            if name in self.dead_forever or name not in self.state:
+                failed = True
+            else:
+                self.state[name] = 120
+                failed = False
+            complete = set(self.attempted) >= set(self.state)
+        if complete:
+            self.done.set()
+        if failed:
+            return handler._json(504, {'message': 'Timeout'})
+        return handler._json(200, {'delay': 120})
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class GatewayReprobeTests(unittest.TestCase):
+    """Regression for '/nodes shows many nodes offline': mihomo's url-test /
+    fallback group probes run lazily (~5 min) and, at 100+ nodes, a bulk sweep
+    times out under load while fallback groups stop probing after the first
+    survivor - so reachable nodes can carry a stale 'dead' verdict. The status
+    reader must re-test offline rows through the controller's own delay API
+    (which rewrites mihomo's history) so the page recovers the real verdict."""
+
+    def setUp(self):
+        self._old_env = {k: os.environ.get(k) for k in (
+            'SHARE_GATEWAY_API', 'SHARE_GATEWAY_SECRET',
+            'SHARE_STATE_DIR', 'SHARE_CLASH_DIR')}
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        clash = self.root / 'clash'
+        state = self.root / 'state'
+        (clash / 'airports').mkdir(parents=True)
+        (clash / 'airports' / 'mango-clash.yaml').write_text('proxies: []\n', encoding='utf-8')
+        state.mkdir()
+        (state / 'share-nodes.json').write_text('[]', encoding='utf-8')
+        (state / 'exclude.json').write_text('[]', encoding='utf-8')
+        secret = self.root / 'controller-secret'
+        secret.write_text('test-secret\n', encoding='utf-8')
+        self.gw = _FakeGateway(dead_forever=('node-dead',))
+        with self.gw.lock:
+            self.gw.state.update({'node-a': 0, 'node-b': 0, 'node-dead': 0})
+        os.environ['SHARE_STATE_DIR'] = str(state)
+        os.environ['SHARE_CLASH_DIR'] = str(clash)
+        os.environ['SHARE_GATEWAY_API'] = f'http://127.0.0.1:{self.gw.port}'
+        os.environ['SHARE_GATEWAY_SECRET'] = str(secret)
+        import importlib
+        import server as srv
+        importlib.reload(srv)
+        self.srv = srv
+
+    def _wait_round_done(self, timeout=10):
+        """A round sets running=False only after invalidating the cache, so
+        waiting on it also guarantees the next read sees the new verdict."""
+        deadline = time.time() + timeout
+        while self.srv._GATEWAY_PROBE['running'] and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(self.srv._GATEWAY_PROBE['running'], 'probe round never finished')
+
+    def tearDown(self):
+        deadline = time.time() + 5
+        while self.srv._GATEWAY_PROBE['running'] and time.time() < deadline:
+            time.sleep(0.02)
+        self.gw.close()
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_offline_rows_are_reprobed_and_reachable_ones_revive(self):
+        nodes, err = self.srv.STATE.gateway_nodes()
+        self.assertEqual(err, '')
+        self.assertEqual({n['name'] for n in nodes}, {'node-a', 'node-b', 'node-dead'})
+        self.assertFalse(any(n['alive'] for n in nodes), 'controller starts all-dead')
+        self.assertTrue(self.gw.done.wait(10),
+                        'background re-probe never hit the delay endpoint')
+        self._wait_round_done()
+        # The probe round invalidated the 15s cache; the next read must reflect
+        # mihomo's corrected verdict - reachable rows online, truly-dead still dead.
+        nodes2, err2 = self.srv.STATE.gateway_nodes()
+        self.assertEqual(err2, '')
+        by = {n['name']: n for n in nodes2}
+        self.assertTrue(by['node-a']['alive'])
+        self.assertTrue(by['node-b']['alive'])
+        self.assertEqual(by['node-a']['delay'], 120)
+        self.assertFalse(by['node-dead']['alive'])
+        self.assertEqual(set(self.gw.attempted), {'node-a', 'node-b', 'node-dead'})
+
+    def test_reprobe_is_throttled_within_the_gap(self):
+        self.srv.STATE.gateway_nodes()
+        self.assertTrue(self.gw.done.wait(10))
+        self._wait_round_done()
+        attempts = list(self.gw.attempted)
+        # A second read must not kick another round inside the 120s gap.
+        self.srv.STATE.gateway_nodes()
+        time.sleep(0.3)
+        self.assertEqual(self.gw.attempted, attempts)
