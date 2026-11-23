@@ -2338,6 +2338,17 @@ class Review8Tests(AccountHarness):
                 chunks.append(b)
             return b''.join(chunks)
 
+    def test_table_wrap_contains_hidden_labels(self):
+        # .visually-hidden labels inside the admin table are absolutely
+        # positioned; without a positioned .table-wrap they escape its
+        # horizontal scroll clip and widen the whole page on phones.
+        import re as _re
+        import pages
+        rule = _re.search(r'\.table-wrap\{([^}]*)\}', pages._CSS)
+        self.assertIsNotNone(rule)
+        self.assertIn('overflow-x:auto', rule.group(1))
+        self.assertIn('position:relative', rule.group(1))
+
     def test_fresh_install_without_optional_inputs_renders(self):
         # share-nodes.json / exclude.json are optional in full scope: a fresh
         # install (README quick start) must not 500 every subscription.

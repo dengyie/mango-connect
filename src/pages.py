@@ -744,7 +744,7 @@ button.chip{font:inherit;font-size:12.5px;font-weight:600;cursor:pointer}
 @media (max-width:640px){.endpoint{grid-template-columns:minmax(0,1fr)}}
 
 /* ---- tables ---- */
-.table-wrap{overflow-x:auto}
+.table-wrap{overflow-x:auto;position:relative}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{position:sticky;top:0;text-align:left;color:var(--ink-3);font-size:11.5px;font-weight:650;letter-spacing:.04em;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--raised);white-space:nowrap}
 td{padding:12px;border-bottom:1px solid var(--line);vertical-align:top}
