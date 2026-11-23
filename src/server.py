@@ -77,12 +77,25 @@ class ShareState:
         self.user_renders: Dict[str, tuple] = {}
         self._user_render_lock = threading.Lock()
 
+    def _hash_inputs(self, h) -> None:
+        """Feed every render input into `h`. share-nodes.json and
+        exclude.json are optional (render reads a missing one as empty), so a
+        fresh install without them must still render; the source pool is
+        mandatory and its absence raises."""
+        for key in ('source', 'share_nodes', 'exclude'):
+            try:
+                data = self.paths[key].read_bytes()
+            except FileNotFoundError:
+                if key == 'source':
+                    raise
+                data = b'\0missing'
+            h.update(hashlib.sha256(data).digest())
+
     def _inputs_sha(self) -> str:
         """Fingerprint every render input, not just the source pool, so
         share-nodes.json / exclude.json edits take effect without a restart."""
         h = hashlib.sha256()
-        for key in ('source', 'share_nodes', 'exclude'):
-            h.update(hashlib.sha256(self.paths[key].read_bytes()).digest())
+        self._hash_inputs(h)
         return h.hexdigest()
 
     def _node_cred_map(self) -> list:
@@ -105,8 +118,7 @@ class ShareState:
         creds = user.get('credentials') or {}
         cred_map = self._node_cred_map()
         h = hashlib.sha256()
-        for key in ('source', 'share_nodes', 'exclude'):
-            h.update(hashlib.sha256(self.paths[key].read_bytes()).digest())
+        self._hash_inputs(h)
         h.update(hashlib.sha256(
             json.dumps({'c': creds, 'm': cred_map}, sort_keys=True,
                        ensure_ascii=False).encode('utf-8')).digest())

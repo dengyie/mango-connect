@@ -2338,6 +2338,24 @@ class Review8Tests(AccountHarness):
                 chunks.append(b)
             return b''.join(chunks)
 
+    def test_fresh_install_without_optional_inputs_renders(self):
+        # share-nodes.json / exclude.json are optional in full scope: a fresh
+        # install (README quick start) must not 500 every subscription.
+        (Path(self.tmp.name) / 'share-nodes.json').unlink()
+        (Path(self.tmp.name) / 'exclude.json').unlink()
+        old = os.environ.get('SHARE_SCOPE')
+        os.environ['SHARE_SCOPE'] = 'full'
+        try:
+            _, token = tk.create_token(tk.token_file(), 'fresh')
+            status, _, body = self._req(f'/sub/{token}')
+            self.assertEqual(status, 200, body[:200])
+            self.assertIn(b'demo-reality', body)
+        finally:
+            if old is None:
+                os.environ.pop('SHARE_SCOPE', None)
+            else:
+                os.environ['SHARE_SCOPE'] = old
+
     def test_oversized_post_closes_connection(self):
         body = b'x' * 5000
         resp = self._raw(b'POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n' + body)
