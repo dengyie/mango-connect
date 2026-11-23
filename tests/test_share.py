@@ -3035,11 +3035,11 @@ class ClientCatalogTests(unittest.TestCase):
     def test_clients_page_renders_mirror_and_fallback(self):
         import pages
         clean = self.c.sanitize_manifest(_fake_manifest(), _MIRROR_BASE)
-        html = pages.clients_page(clean, mirror_enabled=True, role=None, logout_csrf='')
+        html = pages.clients_page(clean, mirror_enabled=True, role='user', logout_csrf='t')
         self.assertIn(f'{_MIRROR_BASE}/clash-verge-rev/v2.5.10/Clash.Verge_2.5.10_x64-setup.exe', html)
         self.assertIn('https://github.com/MetaCubeX/ClashMetaForAndroid/releases/latest', html)
         self.assertIn('apps.apple.com', html)
-        self.assertIn('登录后导入订阅', html)
+        self.assertIn('去用户中心导入', html)
         bare = pages.clients_page({'apps': {}}, mirror_enabled=False, role='admin', logout_csrf='t')
         self.assertNotIn(_MIRROR_BASE, bare)
         self.assertIn('去用户中心导入', bare)
@@ -3130,17 +3130,21 @@ class ClientMirrorScriptTests(unittest.TestCase):
 
 
 class ClientsHttpTests(AccountHarness):
-    def test_clients_page_public_and_linked_in_sidebar(self):
-        status, headers, body = self._req('/clients')
+    def test_clients_page_members_only(self):
+        status, headers, _ = self._req('/clients')
+        self.assertEqual(status, 303)
+        self.assertEqual(headers.get('Location'), '/login')
+        for path in ('/', '/login'):
+            _, _, body = self._req(path)
+            self.assertNotIn('/clients', body.decode(), f'anonymous {path} must not link the download area')
+        ck, _ = self._login()
+        status, headers, body = self._req('/clients', headers=self._auth(ck))
         self.assertEqual(status, 200)
         html = body.decode()
         self.assertIn('Clash Verge Rev', html)
+        self.assertIn('去用户中心导入', html)
         self.assertIn('no-store', headers.get('Cache-Control', ''))
         self.assertIn('Content-Security-Policy', headers)
-        ck, _ = self._login()
-        status, _, body = self._req('/clients', headers=self._auth(ck))
-        self.assertEqual(status, 200)
-        self.assertIn('去用户中心导入', body.decode())
         _, _, body = self._req('/', headers=self._auth(ck))
         self.assertIn('href="/clients"', body.decode())
 

@@ -890,8 +890,7 @@ def _sidebar(active: str, role: str, logout_csrf: str) -> str:
     if authed:
         site += item('/dashboard', 'user', '用户中心', 'dashboard')
         site += item('/nodes', 'activity', '节点列表', 'nodes')
-    site += item('/clients', 'download', '客户端下载', 'clients')
-    if authed:
+        site += item('/clients', 'download', '客户端下载', 'clients')
         site += item('/docs', 'file-text', '技术文档', 'docs')
     else:
         site += item('/login', 'login', '登录', 'login')
@@ -1058,6 +1057,11 @@ def landing_page(node_count: int, regions: List[Dict[str, Any]],
                     f'<div class="region-badges">{badges}</div></section>') if badges else (
                     '<div class="region-badges"></div>')
     clients = ''.join(f'<span>{_esc(c)}</span>' for c in _CLIENTS)
+    # The download area is members-only: anonymous visitors get no link.
+    install_hint = ('<a href="/clients">客户端下载</a>提供本站镜像与 GitHub 官方链接。' if authed
+                    else '登录后在「客户端下载」获取本站镜像与 GitHub 官方链接。')
+    dl_btn = (f'<p style="margin-top:14px"><a class="btn" href="/clients">{_icon("download", 15)}下载客户端</a></p>'
+              if authed else '')
     body = f"""
   <section class="hero">
     <p class="eyebrow">{_icon('lock', 14)}Private access · 受邀制</p>
@@ -1075,7 +1079,7 @@ def landing_page(node_count: int, regions: List[Dict[str, Any]],
     <h2>四步接入</h2>
     <ol class="flow">
       <li><strong>获取账号</strong><span class="muted">由分享者开通，本站不开放注册。</span></li>
-      <li><strong>安装客户端</strong><span class="muted"><a href="/clients">客户端下载</a>提供本站镜像与 GitHub 官方链接。</span></li>
+      <li><strong>安装客户端</strong><span class="muted">{install_hint}</span></li>
       <li><strong>登录用户中心</strong><span class="muted">选择客户端一键导入，或直接下载配置文件。</span></li>
       <li><strong>自动更新</strong><span class="muted">客户端按周期拉取，节点与规则变更自动传导。</span></li>
     </ol>
@@ -1083,7 +1087,7 @@ def landing_page(node_count: int, regions: List[Dict[str, Any]],
   <section class="landing-block">
     <h2>支持的客户端</h2>
     <div class="client-list">{clients}</div>
-    <p style="margin-top:14px"><a class="btn" href="/clients">{_icon('download', 15)}下载客户端</a></p>
+    {dl_btn}
     <p class="faint" style="margin-top:12px">共 {int(node_count)} 个节点 · 实际线路以登录后节点状态页为准。</p>
   </section>
   <footer class="site-foot"><span>{VISIBLE_BRAND} · 受邀订阅</span><span>未授权访问将被拒绝</span></footer>"""
@@ -1553,7 +1557,7 @@ _DOC_SECTIONS: Sequence[Tuple[str, str, Sequence[Tuple[str, str]]]] = (
         ('对齐徽章', '与 3x-ui 对齐状态 = 本站输出 sha256 与 gateway mango-clash.meta.json 比对。'),
     )),
     ('clients', '客户端下载镜像', (
-        ('GET /clients', '公开页面：按平台列出推荐客户端（Clash Verge Rev / FlClash / Clash Meta for Android / sing-box / v2rayN / v2rayNG）与 iOS App Store 客户端，每个安装包给出本站镜像与 GitHub 官方下载两个入口。'),
+        ('GET /clients', '登录后可见（未登录 303 到 /login，侧栏与首页对匿名访客不出现入口）：按平台列出推荐客户端（Clash Verge Rev / FlClash / Clash Meta for Android / sing-box / v2rayN / v2rayNG）与 iOS App Store 客户端，每个安装包给出本站镜像与 GitHub 官方下载两个入口。'),
         ('镜像同步', 'scripts/client-mirror.py 在下载站侧每 6 小时读取各项目 GitHub latest release，按目录逐字节镜像到版本化路径（新版本 = 新路径，CDN 无需清缓存），校验大小与 GitHub sha256 digest 后原子落盘，每个应用保留最近 2 个版本。'),
         ('manifest.json', '镜像清单（版本/文件/大小/sha256/镜像与 GitHub 链接），本站每 10 分钟拉取并持久化；镜像链接必须位于清单目录下、GitHub 链接必须属于对应仓库，否则丢弃。清单缺失时页面自动回落到 GitHub 发布页。'),
     )),
@@ -1613,10 +1617,9 @@ def _client_app(app: Dict[str, Any]) -> str:
 
 
 def clients_page(manifest: Dict[str, Any], *, mirror_enabled: bool = False,
-                 role: str = 'anon', logout_csrf: str = '') -> str:
-    """Public client download page: catalog grouped by platform, mirror
+                 role: str = 'user', logout_csrf: str = '') -> str:
+    """Members-only client download page: catalog grouped by platform, mirror
     links from the download-site manifest, GitHub as fallback/alternative."""
-    authed = role in ('user', 'admin')
     view = clients.platform_view(manifest)
     gen = float(manifest.get('generated') or 0)
     if manifest.get('apps'):
@@ -1641,8 +1644,7 @@ def clients_page(manifest: Dict[str, Any], *, mirror_enabled: bool = False,
             f'<section class="panel" id="p-{p["key"]}"><div class="panel-head"><h2>'
             f'{_icon(_PLATFORM_ICON.get(p["key"], "monitor"), 16)}{_esc(p["label"])}</h2>{note}</div>'
             + ''.join(_client_app(a) for a in p['apps']) + extra + '</section>')
-    action = (f'<a class="btn" href="/dashboard">{_icon("user", 15)}去用户中心导入</a>' if authed
-              else f'<a class="btn" href="/login">{_icon("login", 15)}登录后导入订阅</a>')
+    action = f'<a class="btn" href="/dashboard">{_icon("user", 15)}去用户中心导入</a>'
     body = f"""
   {_page_head('客户端下载', eyebrow='下载', eyebrow_icon='download',
               lede='按平台挑一个客户端安装，再到用户中心「一键导入」订阅。桌面端推荐 Clash Verge Rev，Android 推荐 FlClash，iOS 推荐 Shadowrocket。',
