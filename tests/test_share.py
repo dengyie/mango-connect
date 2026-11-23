@@ -2328,6 +2328,24 @@ class GatewayReprobeTests(unittest.TestCase):
         by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
         self.assertFalse(by['node-a']['alive'])
 
+    def test_sweep_flap_of_a_live_row_is_masked_until_reprobe_fails(self):
+        with self.gw.lock:
+            self.gw.state.update({'node-a': 90})
+        self.srv.STATE.gateway_nodes()                    # observes node-a alive
+        deadline = time.time() + 10
+        while not self.srv._GATEWAY_PROBE['running'] and time.time() < deadline \
+                and len(self.gw.attempted) < 2:
+            time.sleep(0.02)
+        self._wait_round_done()
+        self.assertNotIn('node-a', self.gw.attempted)     # alive rows not probed
+        with self.gw.lock:
+            self.gw.state['node-a'] = 0                   # sweep flap
+        with self.srv._GATEWAY_CACHE_LOCK:
+            self.srv._GATEWAY_CACHE['ts'] = 0.0
+        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
+        self.assertTrue(by['node-a']['alive'], 'recent healthy observation masks the flap')
+        self.assertFalse(by['node-dead']['alive'])
+
     def test_reprobe_is_throttled_within_the_gap(self):
         self.srv.STATE.gateway_nodes()
         self.assertTrue(self.gw.done.wait(10))

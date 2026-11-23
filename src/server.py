@@ -156,6 +156,15 @@ class ShareState:
                 data = json.loads(resp.read().decode('utf-8', 'replace'))
             nodes = _normalize_gateway_proxies(data)
             err = ''
+            # Remember every healthy observation too: the next bulk sweep
+            # flaps ~30 live rows to delay=0 for a minute or two. Rows that
+            # really die are still caught - they show offline in the raw
+            # payload, get re-probed within one round, and a failed probe
+            # drops the verdict.
+            with _GATEWAY_VERDICT_LOCK:
+                for n in nodes:
+                    if n['alive'] and n['delay']:
+                        _GATEWAY_VERDICT[n['name']] = (now, n['delay'])
         except Exception as e:  # stale cache beats a hard error for the page
             err = f'gateway unreachable: {e}'
         with _GATEWAY_CACHE_LOCK:
