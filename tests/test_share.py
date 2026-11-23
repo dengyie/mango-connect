@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -2468,6 +2470,8 @@ class Review8Tests(AccountHarness):
         rocket = links['Shadowrocket'].removeprefix('sub://')
         self.assertEqual(base64.urlsafe_b64decode(rocket + '=' * (-len(rocket) % 4)).decode(), url)
         self.assertNotIn('fmt=', unquote(links['Clash / Mihomo']))
+        self.assertTrue(links['Sing-Box'].startswith('sing-box://import-remote-profile?url='))
+        self.assertIn(quote_plain(url + '&fmt=singbox'), links['Sing-Box'])
 
     def test_export_link_carries_userinfo_and_surge_managed_header(self):
         ck, csrf = self._login()
@@ -2901,3 +2905,234 @@ class NodePoolWorkerTests(unittest.TestCase):
         self.assertEqual(by['node-0']['status'], 'alive')
         # reopen a dummy server so tearDown's close() is harmless
         self.gw = _FakeGateway()
+
+
+
+# ---------------------------------------------------------------------------
+# Client download catalog + mirror manifest
+# ---------------------------------------------------------------------------
+_MIRROR_BASE = 'https://dl.example.com/pub/clients'
+
+
+def _fake_manifest(**over):
+    import clients
+    app = clients.APPS_BY_KEY['clash-verge-rev']
+    spec = app.assets[0]
+    name = 'Clash.Verge_2.5.10_x64-setup.exe'
+    entry = {'tag': 'v2.5.10', 'published': '2026-11-01T10:00:00Z',
+             'assets': {spec.id: {
+                 'name': name, 'size': 31457280, 'sha256': 'a' * 64,
+                 'url': f'{_MIRROR_BASE}/clash-verge-rev/v2.5.10/{name}',
+                 'github_url': f'https://github.com/{app.repo}/releases/download/v2.5.10/{name}'}}}
+    entry['assets'][spec.id].update(over)
+    return {'version': 1, 'generated': 1764000000.0, 'base_url': _MIRROR_BASE,
+            'apps': {'clash-verge-rev': entry}}
+
+
+class _FakeResp:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self, n=-1):
+        return self.body if n < 0 else self.body[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class ClientCatalogTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+        import clients
+        self.c = clients
+
+    def test_pick_assets_exactly_one_match_and_skips_legacy(self):
+        sb = self.c.APPS_BY_KEY['sing-box']
+        names = ['SFA-1.14.4-universal.apk', 'SFA-1.14.4-arm64-v8a.apk',
+                 'SFA-1.14.4-legacy-android-5-arm64-v8a.apk',
+                 'sing-box-1.14.4-windows-amd64.zip']
+        picked, problems = self.c.pick_assets(sb, [{'name': n} for n in names])
+        arm = [a for a in sb.assets if a.platform == 'android'][0]
+        self.assertEqual(picked[arm.id]['name'], 'SFA-1.14.4-arm64-v8a.apk')
+        self.assertTrue(problems, 'assets absent from the release are reported')
+        # two hits for one pattern -> ambiguous, not picked
+        dup = [{'name': 'SFA-1.14.4-arm64-v8a.apk'}, {'name': 'SFA-1.14.5-arm64-v8a.apk'}]
+        picked, problems = self.c.pick_assets(sb, dup)
+        self.assertNotIn(arm.id, picked)
+        self.assertTrue(any('2 matches' in p for p in problems))
+
+    def test_every_catalog_pattern_is_anchored(self):
+        for app in self.c.CATALOG:
+            self.assertLessEqual(set(app.recommended), {p for p, _ in self.c.PLATFORMS})
+            for a in app.assets:
+                self.assertTrue(a.pattern.startswith('^') and a.pattern.endswith('$'), a.pattern)
+                self.assertIn(a.platform, {p for p, _ in self.c.PLATFORMS})
+
+    def test_sanitize_keeps_good_entry(self):
+        out = self.c.sanitize_manifest(_fake_manifest(), _MIRROR_BASE)
+        app = out['apps']['clash-verge-rev']
+        self.assertEqual(app['version'], '2.5.10')
+        self.assertEqual(app['published'], '2026-11-01')
+        self.assertEqual(len(app['assets']), 1)
+
+    def test_sanitize_rejects_foreign_and_tampered_links(self):
+        bad = [
+            {'url': 'https://evil.example/x.exe'},
+            {'url': 'javascript:alert(1)'},
+            {'github_url': 'https://github.com/someone/else/releases/download/v1/x.exe'},
+            {'sha256': 'nothex'},
+            {'size': 0},
+            {'name': '../../etc/passwd'},
+        ]
+        for over in bad:
+            out = self.c.sanitize_manifest(_fake_manifest(**over), _MIRROR_BASE)
+            self.assertEqual(out['apps']['clash-verge-rev']['assets'], {}, over)
+        m = _fake_manifest()
+        m['apps']['not-a-catalog-app'] = m['apps']['clash-verge-rev']
+        self.assertNotIn('not-a-catalog-app', self.c.sanitize_manifest(m, _MIRROR_BASE)['apps'])
+        self.assertEqual(self.c.sanitize_manifest(_fake_manifest(), 'http://dl.example.com/pub/clients')['apps'], {})
+        self.assertEqual(self.c.sanitize_manifest('junk', _MIRROR_BASE)['apps'], {})
+
+    def test_cache_refresh_persists_and_keeps_last_good(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'clients-manifest.json'
+            cache = self.c.ManifestCache(_MIRROR_BASE + '/manifest.json', path)
+            body = json.dumps(_fake_manifest()).encode()
+            self.assertTrue(cache.refresh(opener=lambda req, timeout: _FakeResp(body)))
+            self.assertIn('clash-verge-rev', cache.get()['apps'])
+            self.assertTrue(path.is_file())
+
+            def boom(req, timeout):
+                raise OSError('network down')
+            self.assertFalse(cache.refresh(opener=boom))
+            self.assertIn('network down', cache.last_error)
+            self.assertIn('clash-verge-rev', cache.get()['apps'], 'last good copy kept')
+            self.assertFalse(cache.refresh(opener=lambda req, timeout: _FakeResp(b'{"apps": {}}')))
+            self.assertIn('clash-verge-rev', cache.get()['apps'])
+            # restart: persisted copy is served before the first fetch
+            again = self.c.ManifestCache(_MIRROR_BASE + '/manifest.json', path)
+            self.assertIn('clash-verge-rev', again.get()['apps'])
+            self.assertFalse(self.c.ManifestCache('', path).enabled)
+
+    def test_cache_rejects_oversized_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = self.c.ManifestCache(_MIRROR_BASE + '/manifest.json', Path(d) / 'm.json')
+            big = b' ' * (cache.MAX_BYTES + 10)
+            self.assertFalse(cache.refresh(opener=lambda req, timeout: _FakeResp(big)))
+            self.assertIn('too large', cache.last_error)
+
+    def test_platform_view_falls_back_to_github(self):
+        view = {p['key']: p for p in self.c.platform_view({})}
+        self.assertEqual(set(view), {p for p, _ in self.c.PLATFORMS})
+        win = view['windows']['apps']
+        self.assertEqual(win[0]['key'], 'clash-verge-rev', 'recommended app sorts first')
+        self.assertTrue(all(f['mirror'] is None for f in win[0]['files']))
+        self.assertTrue(all(r['store'] for r in view['ios']['apps']))
+
+    def test_clients_page_renders_mirror_and_fallback(self):
+        import pages
+        clean = self.c.sanitize_manifest(_fake_manifest(), _MIRROR_BASE)
+        html = pages.clients_page(clean, mirror_enabled=True, role=None, logout_csrf='')
+        self.assertIn(f'{_MIRROR_BASE}/clash-verge-rev/v2.5.10/Clash.Verge_2.5.10_x64-setup.exe', html)
+        self.assertIn('https://github.com/MetaCubeX/ClashMetaForAndroid/releases/latest', html)
+        self.assertIn('apps.apple.com', html)
+        self.assertIn('登录后导入订阅', html)
+        bare = pages.clients_page({'apps': {}}, mirror_enabled=False, role='admin', logout_csrf='t')
+        self.assertNotIn(_MIRROR_BASE, bare)
+        self.assertIn('去用户中心导入', bare)
+
+
+class ClientMirrorScriptTests(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location('client_mirror', root / 'scripts' / 'client-mirror.py')
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / 'clients'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _release(self, tag):
+        import clients
+        app = clients.APPS_BY_KEY['v2rayn']
+        name = 'v2rayN-windows-64.zip'
+        assert re.match(app.assets[0].pattern, name)
+        return {'tag_name': tag, 'published_at': '2026-11-20T00:00:00Z',
+                'html_url': f'https://github.com/{app.repo}/releases/tag/{tag}',
+                'assets': [{'name': name, 'size': 5,
+                            'browser_download_url': f'https://github.com/{app.repo}/releases/download/{tag}/{name}',
+                            'digest': 'sha256:' + hashlib.sha256(b'hello').hexdigest()}]}
+
+    def test_run_once_writes_valid_manifest_and_prunes(self):
+        import clients
+        calls = []
+
+        def fake_download(url, dest, size, digest, attempts=3):
+            calls.append(url)
+            dest.write_bytes(b'hello')
+            return hashlib.sha256(b'hello').hexdigest()
+
+        self.m.download = fake_download
+        for i, tag in enumerate(('7.1.0', '7.2.0', '7.3.0')):
+            self.m.latest_release = lambda repo, t=tag: self._release(t)
+            self.assertEqual(self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False), 0)
+            os.utime(self.root / 'v2rayn' / tag, (1000 + i, 1000 + i))
+        data = json.loads((self.root / 'manifest.json').read_text())
+        clean = clients.sanitize_manifest(data, _MIRROR_BASE)
+        self.assertEqual(clean['apps']['v2rayn']['tag'], '7.3.0')
+        self.assertEqual(len(clean['apps']['v2rayn']['assets']), 1)
+        self.assertTrue((self.root / 'v2rayn' / '7.3.0' / 'SHA256SUMS').is_file())
+        # third round pruned the oldest dir beyond --keep 2 (cur + prev survive)
+        self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
+        self.assertFalse((self.root / 'v2rayn' / '7.1.0').exists())
+        # unchanged release: no re-download
+        n = len(calls)
+        self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
+        self.assertEqual(len(calls), n)
+
+    def test_failed_app_keeps_previous_entry(self):
+        self.m.download = lambda url, dest, size, digest, attempts=3: (
+            dest.write_bytes(b'hello'), hashlib.sha256(b'hello').hexdigest())[1]
+        self.m.latest_release = lambda repo: self._release('7.3.0')
+        self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
+
+        def down(repo):
+            raise OSError('rate limited')
+        self.m.latest_release = down
+        self.assertEqual(self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False), 1)
+        data = json.loads((self.root / 'manifest.json').read_text())
+        self.assertEqual(data['apps']['v2rayn']['tag'], '7.3.0')
+
+
+class ClientsHttpTests(AccountHarness):
+    def test_clients_page_public_and_linked_in_sidebar(self):
+        status, headers, body = self._req('/clients')
+        self.assertEqual(status, 200)
+        html = body.decode()
+        self.assertIn('Clash Verge Rev', html)
+        self.assertIn('no-store', headers.get('Cache-Control', ''))
+        self.assertIn('Content-Security-Policy', headers)
+        ck, _ = self._login()
+        status, _, body = self._req('/clients', headers=self._auth(ck))
+        self.assertEqual(status, 200)
+        self.assertIn('去用户中心导入', body.decode())
+        _, _, body = self._req('/', headers=self._auth(ck))
+        self.assertIn('href="/clients"', body.decode())
+
+    def test_health_reports_clients_mirror(self):
+        status, _, body = self._req('/health')
+        self.assertEqual(status, 200)
+        info = json.loads(body)
+        self.assertIn('clients_mirror', info)
+        self.assertFalse(info['clients_mirror']['enabled'])
+
+    def test_favicon_serves_brand_mark(self):
+        status, headers, body = self._req('/favicon.ico')
+        self.assertEqual(status, 200)
+        self.assertTrue(body.startswith(b'\x89PNG'), body[:8])

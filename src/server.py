@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import clients
 import pages
 import format_converters as fmtconv
 import node_pool
@@ -380,6 +381,26 @@ def _pool_loop() -> None:
 def start_pool_worker() -> None:
     threading.Thread(target=_pool_loop, name='node-pool', daemon=True).start()
 
+
+# Client download mirror: manifest published by scripts/client-mirror.py on
+# the download site. Unset URL = no mirror, /clients links GitHub only.
+CLIENTS = clients.ManifestCache(os.environ.get('SHARE_CLIENTS_MANIFEST_URL', ''),
+                                const.state_dir() / 'clients-manifest.json')
+
+
+def _clients_loop() -> None:
+    while True:
+        try:
+            CLIENTS.refresh()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(CLIENTS.ttl)
+
+
+def start_clients_worker() -> None:
+    if CLIENTS.enabled:
+        threading.Thread(target=_clients_loop, name='clients-manifest', daemon=True).start()
+
 # Landing-page region badges, keyed by the rendered output's sha256.
 _REGIONS_CACHE: Dict[str, Any] = {'sha': '', 'regions': []}
 _REGIONS_CACHE_LOCK = threading.Lock()
@@ -488,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_sub()
             elif path.startswith('/info/'):
                 self._serve_info()
-            elif path == '/brand/mango-connect-mark.png':
+            elif path in ('/brand/mango-connect-mark.png', '/favicon.ico'):
                 self._serve_brand_asset()
             elif path == '/health':
                 self._serve_health()
@@ -502,6 +523,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_nodes()
             elif path == '/docs':
                 self._serve_docs()
+            elif path == '/clients':
+                self._serve_clients()
             elif path == '/nodes/api':
                 self._serve_nodes_api()
             elif path == '/admin/audit':
@@ -892,6 +915,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
                    headers=headers)
 
+    def _serve_clients(self) -> None:
+        """Public client download page (installers are public software;
+        nothing account-specific is rendered). Sidebar adapts to session."""
+        user = self._current_user()
+        role = str(user.get('role') or 'anon') if user else 'anon'
+        tok, setc = self._csrf_pair() if user else ('', None)
+        headers = [('Cache-Control', 'no-store'), *_html_security_headers()]
+        if setc:
+            headers.append(('Set-Cookie', setc))
+        html_body = pages.clients_page(CLIENTS.get(), mirror_enabled=CLIENTS.enabled,
+                                       role=role, logout_csrf=tok)
+        self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
+                   headers=headers)
+
     def _serve_nodes(self) -> None:
         user = self._current_user()
         if user is None:
@@ -945,6 +982,11 @@ class Handler(BaseHTTPRequestHandler):
                    'share_scope': render_public.share_scope(),
                    'aligned_with_gateway': STATE.last_meta.get('aligned'),
                    'node_pool': STATE.pool.counts(),
+                   'clients_mirror': {
+                       'enabled': CLIENTS.enabled,
+                       'apps': len(CLIENTS.get()['apps']),
+                       'generated': int(CLIENTS.get()['generated']),
+                       'error': CLIENTS.last_error},
                    'per_user_yaml': bool(PER_USER_YAML)}
         self._send(200, json.dumps(payload).encode(),
                    headers={'Cache-Control': 'no-store'})
@@ -1664,6 +1706,7 @@ def main() -> int:
 
     if os.environ.get('SHARE_NODE_POOL', '1') != '0':
         start_pool_worker()
+    start_clients_worker()
     srv = ThreadingHTTPServer((args.listen, args.port), Handler)
     print(f'mango-share listening on {args.listen}:{args.port}', flush=True)
     srv.serve_forever()

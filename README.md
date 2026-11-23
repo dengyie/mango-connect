@@ -91,6 +91,28 @@ loopback by default.
 | `SHARE_GATEWAY_API` | `http://127.0.0.1:9090` | mihomo controller for `/nodes` |
 | `SHARE_GATEWAY_SECRET` | `<clash>/.controller-secret` | controller secret file |
 | `ONE_MAIL_API_BASE` / `ONE_MAIL_SEND_TOKEN` | unset | reminder mail transport (log-only when unset) |
+| `SHARE_CLIENTS_MANIFEST_URL` | unset | public `manifest.json` written by `scripts/client-mirror.py` (e.g. `https://dl.example.com/pub/clients/manifest.json`); unset = `/clients` links GitHub only |
+
+## Client download mirror
+
+`/clients` lists the recommended client per platform (Clash Verge Rev,
+FlClash, CMFA, sing-box, v2rayN/v2rayNG, iOS App Store apps). Release assets
+always link GitHub; when `SHARE_CLIENTS_MANIFEST_URL` is set, each file also
+gets a mirror link served from your own download host.
+
+Run the mirror on the host whose nginx serves the download directory:
+
+```sh
+python3 scripts/client-mirror.py --root /srv/pub/clients \
+    --base-url https://dl.example.com/pub/clients --dry-run   # preview
+python3 scripts/client-mirror.py --root /srv/pub/clients \
+    --base-url https://dl.example.com/pub/clients --loop 21600 # daemon
+```
+
+Files land in versioned dirs (`<app>/<tag>/`, CDN-safe), are verified against
+GitHub's sha256 digest, and the newest two versions are kept. The share site
+re-reads the manifest every 10 minutes and caches the last good copy in the
+state dir. Set `GITHUB_TOKEN` if the 60 req/h anonymous API limit is tight.
 
 ## Deploying with supervisor
 

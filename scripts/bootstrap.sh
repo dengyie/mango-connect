@@ -33,7 +33,8 @@ step "python check"
 command -v python3 >/dev/null || { echo "  python3 missing"; exit 1; }
 python3 -m py_compile "$SRC"/server.py "$SRC"/users.py "$SRC"/pages.py \
   "$SRC"/tokens.py "$SRC"/state_backup.py "$SRC"/notify.py \
-  "$SRC"/render_public.py "$SRC"/sync_exclude.py "$SRC"/share_constants.py
+  "$SRC"/render_public.py "$SRC"/sync_exclude.py "$SRC"/share_constants.py \
+  "$SRC"/clients.py "$SRC"/node_pool.py "$SRC"/format_converters.py
 
 step "state dirs + permissions"
 run mkdir -p "$STATE"/public "$STATE"/logs "$STATE"/backups

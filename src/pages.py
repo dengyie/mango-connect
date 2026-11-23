@@ -20,6 +20,7 @@ import time
 from urllib.parse import quote
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import clients
 from users import fmt_bytes
 from share_constants import public_host as _public_host_default
 
@@ -84,6 +85,7 @@ _ICONS: Dict[str, str] = {
     'shield': '<path d="M12 3a12 12 0 0 0 8.5 3A12 12 0 0 1 12 21 12 12 0 0 1 3.5 6 12 12 0 0 0 12 3"/>',
     'key': '<path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1-4.069 0l-.301-.301-6.558 6.558a2 2 0 0 1-1.239.578L5.172 21H4a1 1 0 0 1-.993-.883L3 20v-1.172a2 2 0 0 1 .467-1.284l.119-.13.414-.414h2v-2h2v-2l2.144-2.144-.301-.301a2.877 2.877 0 0 1 0-4.069l2.643-2.643a2.877 2.877 0 0 1 4.069 0z"/><path d="M15 9h.01"/>',
     'history': '<path d="M12 8v4l2 2"/><path d="M3.05 11a9 9 0 1 1 .5 4m-.5 5v-5h5"/>',
+    'device-mobile': '<rect x="6" y="3" width="12" height="18" rx="2"/><path d="M11 4h2M12 17v.01"/>',
     'calendar': '<path d="M4 7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7z"/><path d="M16 3v4M8 3v4m-4 4h16"/>',
 }
 
@@ -692,6 +694,20 @@ toast-stack{position:fixed;right:16px;bottom:16px;z-index:80;display:flex;flex-d
 .client-tile svg{color:var(--ink-3);transition:transform .15s,color .15s}
 .client-tile:hover{border-color:var(--accent);background:var(--raised);text-decoration:none}
 .client-tile:hover svg{color:var(--accent);transform:translate(1px,-1px)}
+.client-app{padding:18px 24px}
+.client-app+.client-app{border-top:1px solid var(--line)}
+.client-app-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.client-app-head strong{font-size:15px}
+.client-app-head .repo{margin-left:auto;display:inline-flex;align-items:center;gap:5px;color:var(--ink-3);font-size:12.5px}
+.client-app>p{margin-top:6px;line-height:1.65}
+.dl-rows{display:grid;gap:6px;margin-top:12px}
+.dl-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:8px 10px 8px 14px;border:1px solid var(--line);border-radius:var(--r);background:var(--paper)}
+.dl-label{flex:1 1 200px;min-width:0;font-size:13px;font-weight:600}
+.dl-size{color:var(--ink-3);font-size:12.5px;font-variant-numeric:tabular-nums}
+.sha-list{margin-top:10px}
+.sha-list summary{cursor:pointer;color:var(--ink-3);font-size:12.5px}
+.sha-list code{display:block;margin-top:6px;padding:6px 8px;border-radius:6px;background:var(--sunken);font-size:11.5px;overflow-wrap:anywhere}
+@media (max-width:640px){.client-app{padding:16px 18px}}
 .chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .chip{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:99px;border:1px solid var(--line);background:var(--paper);color:var(--ink-2);font-size:12.5px;font-weight:600}
 .chip:hover{color:var(--ink);border-color:var(--line-2);text-decoration:none}
@@ -831,17 +847,19 @@ def _with_fmt(url: str, fmt: str) -> str:
 
 
 def _client_links(url: str) -> List[Tuple[str, str]]:
-    """Deep links per client. Surge and Quantumult X cannot parse Clash YAML,
-    so they get their native format; Shadowrocket's sub:// scheme takes the
+    """Deep links per client. Sing-Box, Surge and Quantumult X cannot parse
+    Clash YAML, so they get their native format; Shadowrocket's sub:// scheme takes the
     URL base64-encoded (it imports Clash YAML fine)."""
     enc = quote(url, safe='')
     surge = quote(_with_fmt(url, 'surge'), safe='')
+    singbox = quote(_with_fmt(url, 'singbox'), safe='')
     qx = 'quantumult-x:///update-remote-profile?remote-resource=' + quote(
         json.dumps({'server_remote': [f'{_with_fmt(url, "qx")}, tag={VISIBLE_BRAND}']},
                    separators=(',', ':'), ensure_ascii=False), safe='')
     rocket = base64.urlsafe_b64encode(url.encode('utf-8')).decode('ascii').rstrip('=')
     return [
         ('Clash / Mihomo', f'clash://install-config?url={enc}'),
+        ('Sing-Box', f'sing-box://import-remote-profile?url={singbox}#{quote(VISIBLE_BRAND)}'),
         ('Stash', f'stash://install-config?url={enc}'),
         ('Shadowrocket', f'sub://{rocket}'),
         ('Surge', f'surge:///install-config?url={surge}'),
@@ -872,6 +890,8 @@ def _sidebar(active: str, role: str, logout_csrf: str) -> str:
     if authed:
         site += item('/dashboard', 'user', '用户中心', 'dashboard')
         site += item('/nodes', 'activity', '节点列表', 'nodes')
+    site += item('/clients', 'download', '客户端下载', 'clients')
+    if authed:
         site += item('/docs', 'file-text', '技术文档', 'docs')
     else:
         site += item('/login', 'login', '登录', 'login')
@@ -1052,9 +1072,10 @@ def landing_page(node_count: int, regions: List[Dict[str, Any]],
   </div>
   {region_block}
   <section class="landing-block">
-    <h2>三步接入</h2>
+    <h2>四步接入</h2>
     <ol class="flow">
       <li><strong>获取账号</strong><span class="muted">由分享者开通，本站不开放注册。</span></li>
+      <li><strong>安装客户端</strong><span class="muted"><a href="/clients">客户端下载</a>提供本站镜像与 GitHub 官方链接。</span></li>
       <li><strong>登录用户中心</strong><span class="muted">选择客户端一键导入，或直接下载配置文件。</span></li>
       <li><strong>自动更新</strong><span class="muted">客户端按周期拉取，节点与规则变更自动传导。</span></li>
     </ol>
@@ -1062,6 +1083,7 @@ def landing_page(node_count: int, regions: List[Dict[str, Any]],
   <section class="landing-block">
     <h2>支持的客户端</h2>
     <div class="client-list">{clients}</div>
+    <p style="margin-top:14px"><a class="btn" href="/clients">{_icon('download', 15)}下载客户端</a></p>
     <p class="faint" style="margin-top:12px">共 {int(node_count)} 个节点 · 实际线路以登录后节点状态页为准。</p>
   </section>
   <footer class="site-foot"><span>{VISIBLE_BRAND} · 受邀订阅</span><span>未授权访问将被拒绝</span></footer>"""
@@ -1178,6 +1200,7 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
         <p class="section-title">{_icon('external-link', 14)}一键导入</p>
         <p class="faint">选择你的客户端，点击即自动导入；客户端会以此地址长期自动更新。</p>
         {_client_tiles(export_url)}
+        <p class="faint" style="margin-top:10px">还没装客户端？到 <a href="/clients">客户端下载</a> 获取（本站镜像，国内直连；附 GitHub 官方链接）。</p>
       </div>
       <div class="section">
         <p class="section-title">{_icon('code', 14)}其他格式下载</p>
@@ -1529,12 +1552,114 @@ _DOC_SECTIONS: Sequence[Tuple[str, str, Sequence[Tuple[str, str]]]] = (
         ('节点池状态机', '可用 10 分钟/次，连续 3 次失败→存疑；存疑 30 分钟/次，连续 2 次成功→可用，连续 10 次失败→死亡；死亡每天复测，成功→存疑。失败需两次尝试确认，网关侧故障触发熔断不计数；剔除后少于 25% 时不剔除。'),
         ('对齐徽章', '与 3x-ui 对齐状态 = 本站输出 sha256 与 gateway mango-clash.meta.json 比对。'),
     )),
+    ('clients', '客户端下载镜像', (
+        ('GET /clients', '公开页面：按平台列出推荐客户端（Clash Verge Rev / FlClash / Clash Meta for Android / sing-box / v2rayN / v2rayNG）与 iOS App Store 客户端，每个安装包给出本站镜像与 GitHub 官方下载两个入口。'),
+        ('镜像同步', 'scripts/client-mirror.py 在下载站侧每 6 小时读取各项目 GitHub latest release，按目录逐字节镜像到版本化路径（新版本 = 新路径，CDN 无需清缓存），校验大小与 GitHub sha256 digest 后原子落盘，每个应用保留最近 2 个版本。'),
+        ('manifest.json', '镜像清单（版本/文件/大小/sha256/镜像与 GitHub 链接），本站每 10 分钟拉取并持久化；镜像链接必须位于清单目录下、GitHub 链接必须属于对应仓库，否则丢弃。清单缺失时页面自动回落到 GitHub 发布页。'),
+    )),
     ('ops', '运维端点', (
         ('GET /health', '存活/节点数/scope/对齐状态（无鉴权，无敏感信息）。'),
         ('state_backup.py pack', '全状态 tar 包（排除 backups/logs），供容器回收前离线拷贝。'),
         ('bootstrap.sh', 'Bohrium 容器重建后一键恢复运行时（目录/权限/supervisor/cron）。'),
     )),
 )
+
+
+_PLATFORM_ICON = {'android': 'device-mobile', 'ios': 'device-mobile'}
+
+
+def _dl_row(app: Dict[str, Any], f: Dict[str, Any]) -> str:
+    m = f.get('mirror')
+    if m:
+        size = clients.fmt_size(int(m['size']))
+        btns = (f'<a class="btn btn-sm btn-primary" href="{_esc(m["url"])}" rel="noopener">'
+                f'{_icon("download", 14)}镜像下载</a>'
+                f'<a class="btn btn-sm" href="{_esc(m["github_url"])}" rel="noopener noreferrer">'
+                f'GitHub{_icon("external-link", 13)}</a>')
+    else:
+        size = ''
+        btns = (f'<a class="btn btn-sm" href="{_esc(app["releases_url"])}" rel="noopener noreferrer">'
+                f'{_icon("download", 14)}GitHub 发布页{_icon("external-link", 13)}</a>')
+    sz = f'<span class="dl-size">{_esc(size)}</span>' if size else ''
+    return f'<div class="dl-row"><span class="dl-label">{_esc(f["label"])}</span>{sz}{btns}</div>'
+
+
+def _client_app(app: Dict[str, Any]) -> str:
+    rec = '<span class="pill pill-ok">推荐</span>' if app.get('recommended') else ''
+    hint = f'<p class="faint">导入方式：{_esc(clients.FORMAT_HINT.get(app["fmt"], ""))}</p>'
+    if app['store']:
+        return (f'<div class="client-app"><div class="client-app-head"><strong>{_esc(app["name"])}</strong>'
+                f'{rec}<span class="pill pill-plain">{_esc(app["price"])}</span></div>'
+                f'<p class="muted">{_esc(app["blurb"])}</p>{hint}'
+                f'<div class="dl-rows"><div class="dl-row"><span class="dl-label">App Store（美区等非国区）</span>'
+                f'<a class="btn btn-sm btn-primary" href="{_esc(app["url"])}" rel="noopener noreferrer">'
+                f'App Store{_icon("external-link", 13)}</a></div></div></div>')
+    ver = ''
+    if app.get('version'):
+        date = f' · {app["published"]}' if app.get('published') else ''
+        ver = f'<span class="pill pill-plain">v{_esc(app["version"])}{_esc(date)}</span>'
+    rows = ''.join(_dl_row(app, f) for f in app['files'])
+    shas = [(f['mirror']['name'], f['mirror']['sha256']) for f in app['files'] if f.get('mirror')]
+    sha_block = ''
+    if shas:
+        sha_block = ('<details class="sha-list"><summary>SHA-256 校验值</summary>'
+                     + ''.join(f'<code>{_esc(h)}  {_esc(n)}</code>' for n, h in shas)
+                     + '</details>')
+    return (f'<div class="client-app"><div class="client-app-head"><strong>{_esc(app["name"])}</strong>'
+            f'{rec}{ver}<a class="repo" href="{_esc(app["repo_url"])}" rel="noopener noreferrer">'
+            f'源码仓库{_icon("external-link", 13)}</a></div>'
+            f'<p class="muted">{_esc(app["blurb"])}</p>{hint}'
+            f'<div class="dl-rows">{rows}</div>{sha_block}</div>')
+
+
+def clients_page(manifest: Dict[str, Any], *, mirror_enabled: bool = False,
+                 role: str = 'anon', logout_csrf: str = '') -> str:
+    """Public client download page: catalog grouped by platform, mirror
+    links from the download-site manifest, GitHub as fallback/alternative."""
+    authed = role in ('user', 'admin')
+    view = clients.platform_view(manifest)
+    gen = float(manifest.get('generated') or 0)
+    if manifest.get('apps'):
+        status = _notice('ok', f'镜像同步于 {_esc(_fmt_ts(int(gen)))}：安装包与 GitHub 官方 release '
+                               '逐字节一致，可展开「SHA-256 校验值」核对。镜像国内直连，GitHub 链接为官方原址。')
+    elif mirror_enabled:
+        status = _notice('warn', '镜像暂不可用，下方链接指向各项目 GitHub 官方发布页。')
+    else:
+        status = ''
+    nav = ''.join(f'<a class="chip" href="#p-{p["key"]}">'
+                  f'{_icon(_PLATFORM_ICON.get(p["key"], "monitor"), 13)}{_esc(p["label"])}</a>'
+                  for p in view)
+    sections = []
+    for p in view:
+        picks = [a['name'] for a in p['apps'] if a.get('recommended')]
+        note = f'<span class="faint">推荐 {_esc(" / ".join(picks))}</span>' if picks else ''
+        extra = ''
+        if p['key'] == 'ios':
+            extra = _notice('warn', '以上应用均未在中国大陆区 App Store 上架，需使用其他地区（如美区）Apple ID 购买 / 下载。')
+            extra = f'<div class="client-app">{extra}</div>'
+        sections.append(
+            f'<section class="panel" id="p-{p["key"]}"><div class="panel-head"><h2>'
+            f'{_icon(_PLATFORM_ICON.get(p["key"], "monitor"), 16)}{_esc(p["label"])}</h2>{note}</div>'
+            + ''.join(_client_app(a) for a in p['apps']) + extra + '</section>')
+    action = (f'<a class="btn" href="/dashboard">{_icon("user", 15)}去用户中心导入</a>' if authed
+              else f'<a class="btn" href="/login">{_icon("login", 15)}登录后导入订阅</a>')
+    body = f"""
+  {_page_head('客户端下载', eyebrow='下载', eyebrow_icon='download',
+              lede='按平台挑一个客户端安装，再到用户中心「一键导入」订阅。桌面端推荐 Clash Verge Rev，Android 推荐 FlClash，iOS 推荐 Shadowrocket。',
+              actions=action)}
+  {status}
+  <div class="chip-row" style="margin:0 0 16px">{nav}</div>
+  {''.join(sections)}
+  <section class="panel"><div class="panel-head"><h2>{_icon('zap', 16)}装好之后</h2></div>
+    <div class="panel-body"><ol class="flow" style="margin-top:0">
+      <li><strong>登录用户中心</strong><span class="muted">在「订阅控制台 · 一键导入」点你的客户端，订阅自动写入。</span></li>
+      <li><strong>不支持一键导入？</strong><span class="muted">复制「订阅链接」粘贴到客户端的订阅 / 配置 URL；v2rayN / v2rayNG 在链接末尾加 <code>?fmt=uri</code>（链接已含 <code>?</code> 时用 <code>&amp;fmt=uri</code>）。</span></li>
+      <li><strong>开启代理</strong><span class="muted">选「自动选择」或按地区挑节点；客户端会按周期自动更新订阅。</span></li>
+    </ol></div>
+  </section>"""
+    return _shell(f'{VISIBLE_BRAND} · 客户端下载', body,
+                  app=True, active='clients', role=role,
+                  logout_csrf=str(logout_csrf or ''))
 
 
 def docs_page(role: str = 'user', logout_csrf: str = '') -> str:
