@@ -3096,6 +3096,25 @@ class ClientMirrorScriptTests(unittest.TestCase):
         self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
         self.assertEqual(len(calls), n)
 
+    def test_reuploaded_asset_with_new_digest_is_refetched(self):
+        def fake_download(url, dest, size, digest, attempts=3):
+            body = b'hello' if 'old' not in url else b'HELLO'
+            dest.write_bytes(body)
+            return hashlib.sha256(body).hexdigest()
+        self.m.download = fake_download
+        rel = self._release('7.3.0')
+        rel['assets'][0]['browser_download_url'] += '?old'
+        rel['assets'][0]['digest'] = 'sha256:' + hashlib.sha256(b'HELLO').hexdigest()
+        self.m.latest_release = lambda repo: rel
+        self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
+        # same tag/name/size, GitHub now publishes a different digest
+        self.m.latest_release = lambda repo: self._release('7.3.0')
+        self.m.run_once(self.root, _MIRROR_BASE, 2, {'v2rayn'}, False)
+        data = json.loads((self.root / 'manifest.json').read_text())
+        sha = list(data['apps']['v2rayn']['assets'].values())[0]['sha256']
+        self.assertEqual(sha, hashlib.sha256(b'hello').hexdigest())
+        self.assertEqual((self.root / 'v2rayn' / '7.3.0' / 'v2rayN-windows-64.zip').read_bytes(), b'hello')
+
     def test_failed_app_keeps_previous_entry(self):
         self.m.download = lambda url, dest, size, digest, attempts=3: (
             dest.write_bytes(b'hello'), hashlib.sha256(b'hello').hexdigest())[1]

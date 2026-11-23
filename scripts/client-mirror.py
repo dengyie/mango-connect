@@ -163,12 +163,16 @@ def mirror_app(app: 'clients.App', root: Path, base_url: str,
         name, size = str(a['name']), int(a.get('size') or 0)
         dest = vdir / name
         old = prev_assets.get(aid) or {}
+        want = str(a.get('digest') or '')
+        old_sha = str(old.get('sha256') or '')
         if dest.is_file() and dest.stat().st_size == size and old.get('name') == name \
-                and clients._HEX64.match(str(old.get('sha256') or '')):
-            sha = old['sha256']
+                and clients._HEX64.match(old_sha) \
+                and (not want.startswith('sha256:') or want.split(':', 1)[1].lower() == old_sha):
+            # unchanged asset; an in-place re-upload with a new digest falls
+            # through to the full re-hash below
+            sha = old_sha
         elif dest.is_file() and dest.stat().st_size == size:
             sha = sha256_file(dest)
-            want = str(a.get('digest') or '')
             if want.startswith('sha256:') and want.split(':', 1)[1].lower() != sha:
                 log(f'  {name}: on-disk copy fails GitHub digest, re-downloading')
                 sha = download(str(a['browser_download_url']), dest, size, want)
