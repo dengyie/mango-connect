@@ -1,0 +1,108 @@
+name: Deploy
+
+# Every push to main that passes CI ships to production.
+#
+# The host side is scripts/ci-deploy.sh, installed as the forced command of the
+# deploy key: the key cannot open a shell, only stream a release tarball to it
+# (`deploy <sha>`) or ask for `status`. The receiver whitelists the tarball,
+# import-checks the staged module set, backs up, swaps, restarts and
+# health-gates, rolling back on failure.
+#
+# Secrets (environment `production`):
+#   DEPLOY_SSH_HOST         host / IP of the production sshd
+#   DEPLOY_SSH_KEY          private half of the forced-command deploy key
+#   DEPLOY_SSH_KNOWN_HOSTS  pinned host key line(s) - never ssh-keyscan at deploy time
+#   DEPLOY_PUBLIC_URL       public base URL for the post-deploy probe (optional)
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time; never cancel one mid-swap.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: CI gate
+    # Reuse ci.yml so "green" has one definition: `needs:` cannot cross
+    # workflow files, and a parallel CI run would not stop this deploy.
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to production
+    needs: verify
+    # workflow_dispatch can target any ref; only main reaches production, and
+    # forks never get the secrets anyway.
+    if: github.ref == 'refs/heads/main' && github.repository == 'dengyie/mango-connect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package release
+        run: |
+          set -euo pipefail
+          # Only the three deployable trees; the receiver rejects anything else.
+          tar -czf release.tar.gz --owner=0 --group=0 --sort=name \
+            --exclude='__pycache__' --exclude='*.pyc' src scripts assets/brand
+          echo "release $(stat -c %s release.tar.gz) bytes, $(tar -tzf release.tar.gz | wc -l) entries"
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          for v in DEPLOY_SSH_HOST DEPLOY_SSH_KEY DEPLOY_SSH_KNOWN_HOSTS; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is not set"; exit 1; }
+          done
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          install -m 600 /dev/null ~/.ssh/known_hosts
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host prod
+            HostName $DEPLOY_SSH_HOST
+            User root
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            PreferredAuthentications publickey
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+            ConnectTimeout 20
+          EOF
+
+      - name: Deploy
+        run: ssh prod "deploy ${GITHUB_SHA}" < release.tar.gz
+
+      - name: Public probe
+        env:
+          PUBLIC_URL: ${{ secrets.DEPLOY_PUBLIC_URL }}
+        run: |
+          set -euo pipefail
+          [ -n "$PUBLIC_URL" ] || { echo "DEPLOY_PUBLIC_URL unset - skipping"; exit 0; }
+          # Origin health is already gated on the host; this only catches a
+          # broken edge (tunnel/DNS). Retry briefly, report, don't roll back.
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$PUBLIC_URL/login" || true)
+            [ "$code" = 200 ] && { echo "public /login: 200"; exit 0; }
+            echo "attempt $i: public /login -> ${code:-no response}"; sleep 10
+          done
+          echo "::error::origin is healthy but the public URL is not answering"
+          exit 1
+
+      - name: Status
+        if: always()
+        run: ssh prod status || true

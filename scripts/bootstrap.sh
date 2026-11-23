@@ -88,6 +88,24 @@ else
   chmod 0644 /etc/cron.d/mango-share-sync
 fi
 
+step "CI deploy key (forced command; /root is ephemeral)"
+CI_PUB=$STATE/ci/authorized_key.pub
+if [[ -f $CI_PUB && -x $STATE/ci/ci-deploy.sh ]]; then
+  CI_LINE="command=\"$STATE/ci/ci-deploy.sh\",restrict $(cat "$CI_PUB")"
+  if grep -qF "$(awk '{print $2}' "$CI_PUB")" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "  CI key present"
+  elif [[ $DRY == 1 ]]; then
+    echo "    [dry] append CI deploy key to /root/.ssh/authorized_keys"
+  else
+    install -d -m 0700 /root/.ssh
+    printf '%s\n' "$CI_LINE" >> /root/.ssh/authorized_keys
+    chmod 0600 /root/.ssh/authorized_keys
+    echo "  CI key restored"
+  fi
+else
+  echo "  no $CI_PUB - CI deploys disabled"
+fi
+
 step "cloudflared reminder"
 if pgrep -f "cloudflared tunnel" >/dev/null 2>&1; then
   echo "  cloudflared tunnel running"

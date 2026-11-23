@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the floor the README promises; 3.10 is what production runs.
+        python: ['3.8', '3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          # tests run `node --check` on the inline page scripts
+          node-version: '20'
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pyflakes-level ruff
+        run: pipx run ruff check --select F,E9 src
+
+      - name: Shell syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: No production identifiers in tracked files
+        # The repo is public; production hostnames/paths live in the deploy
+        # secrets and the private runbook only. tests/ may name them as banned
+        # strings.
+        run: |
+          if git ls-files -- ':!tests' ':!.github' | xargs grep -nIE 'mangoqwq\.com|/personal/|cfargotunnel' ; then
+            echo "::error::production identifier found in a tracked file"
+            exit 1
+          fi
