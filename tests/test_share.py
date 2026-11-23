@@ -2305,6 +2305,29 @@ class GatewayReprobeTests(unittest.TestCase):
         self.assertFalse(by['node-dead']['alive'])
         self.assertEqual(set(self.gw.attempted), {'node-a', 'node-b', 'node-dead'})
 
+    def test_recheck_survives_a_later_bulk_sweep(self):
+        # mihomo's next url-test sweep flips the same false negatives back to
+        # delay=0; our recent direct success must keep them online.
+        self.srv.STATE.gateway_nodes()
+        self.assertTrue(self.gw.done.wait(10))
+        self._wait_round_done()
+        with self.gw.lock:
+            self.gw.state.update({'node-a': 0, 'node-b': 0})
+        with self.srv._GATEWAY_CACHE_LOCK:
+            self.srv._GATEWAY_CACHE['ts'] = 0.0
+        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
+        self.assertTrue(by['node-a']['alive'])
+        self.assertEqual(by['node-a']['delay'], 120)
+        self.assertFalse(by['node-dead']['alive'])
+        # and the verdict expires: after the TTL the sweep result shows again
+        with self.srv._GATEWAY_VERDICT_LOCK:
+            for k, (ts, d) in list(self.srv._GATEWAY_VERDICT.items()):
+                self.srv._GATEWAY_VERDICT[k] = (ts - self.srv._GATEWAY_VERDICT_TTL - 1, d)
+        with self.srv._GATEWAY_CACHE_LOCK:
+            self.srv._GATEWAY_CACHE['ts'] = time.time()
+        by = {n['name']: n for n in self.srv.STATE.gateway_nodes()[0]}
+        self.assertFalse(by['node-a']['alive'])
+
     def test_reprobe_is_throttled_within_the_gap(self):
         self.srv.STATE.gateway_nodes()
         self.assertTrue(self.gw.done.wait(10))

@@ -23,7 +23,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -142,7 +142,7 @@ class ShareState:
                       and _GATEWAY_CACHE['nodes'] else [])
         if cached:
             _schedule_reprobe(cached)
-            return cached, ''
+            return _overlay_verdicts(cached), ''
         import urllib.request
         nodes: list = []
         err = ''
@@ -163,7 +163,7 @@ class ShareState:
         if not nodes and not _GATEWAY_CACHE['nodes']:
             return [], err
         _schedule_reprobe(list(nodes))
-        return list(nodes), err
+        return _overlay_verdicts(list(nodes)), err
 
     def ensure_fresh(self) -> dict:
         """Re-render when any input changed. Serialized by a lock: concurrent
@@ -207,12 +207,40 @@ _GATEWAY_CACHE_LOCK = threading.Lock()
 # controller's own delay API in the background (a success also rewrites
 # mihomo's history, replacing the stale sweep), throttled and batched.
 _GATEWAY_PROBE_URL = 'http://www.gstatic.com/generate_204'
-_GATEWAY_PROBE_TIMEOUT_MS = 3000
-_GATEWAY_PROBE_WORKERS = 5
+_GATEWAY_PROBE_TIMEOUT_MS = 5000
+_GATEWAY_PROBE_WORKERS = 4      # low fan-out: a wide burst is what misfires
 _GATEWAY_PROBE_GAP = 120        # min seconds between background rounds
-_GATEWAY_PROBE_BATCH = 40       # rows re-tested per round (stalest first)
+_GATEWAY_PROBE_BATCH = 150      # rows re-tested per round (stalest first)
 _GATEWAY_PROBE_LOCK = threading.Lock()
 _GATEWAY_PROBE: Dict[str, Any] = {'running': False, 'last': 0.0}
+# Our own recent successes. mihomo's next bulk sweep (url-test every ~5 min)
+# rewrites history back to delay=0 for the same false negatives, so a revived
+# row would flip to 离线 again minutes later. A direct, low-concurrency probe
+# success within this window outranks a later sweep 'dead'.
+_GATEWAY_VERDICT_TTL = 900
+_GATEWAY_VERDICT: Dict[str, tuple] = {}   # name -> (ts, delay)
+_GATEWAY_VERDICT_LOCK = threading.Lock()
+
+
+def _overlay_verdicts(nodes: list, now: Optional[float] = None) -> list:
+    now = time.time() if now is None else now
+    with _GATEWAY_VERDICT_LOCK:
+        for name in [k for k, (ts, _) in _GATEWAY_VERDICT.items()
+                     if now - ts > _GATEWAY_VERDICT_TTL]:
+            del _GATEWAY_VERDICT[name]
+        verdicts = dict(_GATEWAY_VERDICT)
+    out = []
+    for n in nodes:
+        v = verdicts.get(n['name'])
+        if v and not n.get('alive'):
+            n = dict(n, alive=True, delay=v[1], rechecked=True,
+                     checkedAt=time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(v[0])))
+        out.append(n)
+    out.sort(key=lambda n: (
+        n['delay'] is None or not n['alive'],
+        n['delay'] if n['delay'] is not None else 1 << 30,
+        n['name'].lower()))
+    return out
 
 
 def _gateway_secret() -> str:
@@ -253,7 +281,14 @@ def _probe_round(names: list) -> None:
         secret = _gateway_secret()
         if secret:
             with ThreadPoolExecutor(max_workers=_GATEWAY_PROBE_WORKERS) as pool:
-                list(pool.map(lambda n: _probe_delay(n, secret), names))
+                results = list(pool.map(lambda n: _probe_delay(n, secret), names))
+            now = time.time()
+            with _GATEWAY_VERDICT_LOCK:
+                for name, delay in zip(names, results):
+                    if delay:
+                        _GATEWAY_VERDICT[name] = (now, delay)
+                    else:
+                        _GATEWAY_VERDICT.pop(name, None)
     except Exception:
         pass
     finally:

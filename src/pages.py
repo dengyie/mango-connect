@@ -1372,7 +1372,7 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
     empty_hidden = ' hidden' if nodes else ''
     body = f"""
   {_page_head('节点现状', eyebrow='实时探测', eyebrow_icon='activity',
-              lede='数据来自网关实时探测（15 秒缓存自动刷新）；本页只显示名称/协议/延迟，不含服务器地址与凭据。',
+              lede='数据来自站点网关所在服务器的实时探测（15 秒缓存自动刷新），离线节点会在后台逐个复测；「离线」表示从网关测不通，不代表你本地网络一定不可用。本页只显示名称/协议/延迟，不含服务器地址与凭据。',
               actions=f'<button type="button" class="btn" id="nodes-refresh">{_icon("refresh", 15)}<span class="btn-label">刷新</span></button>')}
   {banner}
   <div class="stats">{stats}</div>
