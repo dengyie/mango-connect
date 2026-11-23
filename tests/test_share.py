@@ -3032,6 +3032,45 @@ class ClientCatalogTests(unittest.TestCase):
         self.assertTrue(all(f['mirror'] is None for f in win[0]['files']))
         self.assertTrue(all(r['store'] for r in view['ios']['apps']))
 
+    def test_detect_platform(self):
+        self.assertEqual(self.c.detect_platform(
+            'Mozilla/5.0 (Linux; Android 14; 23127PN0CC) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36'), 'android')
+        self.assertEqual(self.c.detect_platform(
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15'), 'ios')
+        self.assertEqual(self.c.detect_platform('Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), '')
+        self.assertEqual(self.c.detect_platform(''), '')
+
+    def test_android_catalog_covers_every_abi(self):
+        android = {a.key: {s.id for s in a.assets if s.platform == 'android'} for a in self.c.CATALOG}
+        for key in ('flclash', 'cmfa', 'sing-box', 'v2rayng'):
+            self.assertIn('android-arm64', android[key], key)
+            self.assertIn('android-armv7', android[key], key)
+        for key in ('cmfa', 'sing-box', 'v2rayng'):
+            self.assertIn('android-universal', android[key], key)
+        sb = self.c.APPS_BY_KEY['sing-box']
+        names = ['SFA-1.14.4-universal.apk', 'SFA-1.14.4-armeabi-v7a.apk',
+                 'SFA-1.14.4-legacy-android-5-universal.apk', 'SFA-1.14.4-legacy-android-5-armeabi-v7a.apk']
+        picked, _ = self.c.pick_assets(sb, [{'name': n} for n in names])
+        self.assertEqual(picked['android-universal']['name'], 'SFA-1.14.4-universal.apk')
+        self.assertEqual(picked['android-armv7']['name'], 'SFA-1.14.4-armeabi-v7a.apk')
+        self.assertEqual(picked['android-legacy-universal']['name'], 'SFA-1.14.4-legacy-android-5-universal.apk')
+        ng = self.c.APPS_BY_KEY['v2rayng']
+        picked, _ = self.c.pick_assets(ng, [{'name': 'v2rayNG_2.3.15_universal.apk'},
+                                            {'name': 'v2rayNG_2.3.15-fdroid_universal.apk'}])
+        self.assertEqual(picked['android-universal']['name'], 'v2rayNG_2.3.15_universal.apk')
+
+    def test_clients_page_puts_visitor_platform_first(self):
+        import pages
+        html = pages.clients_page({'apps': {}}, role='user', logout_csrf='t', device='android')
+        self.assertLess(html.index('id="p-android"'), html.index('id="p-windows"'))
+        self.assertIn('class="chip is-active" href="#p-android"', html)
+        self.assertIn('Android 安装指引', html)
+        self.assertIn('已按你的设备置顶', html)
+        desk = pages.clients_page({'apps': {}}, role='user', logout_csrf='t')
+        self.assertLess(desk.index('id="p-windows"'), desk.index('id="p-android"'))
+        self.assertNotIn('is-active', desk.split('id="p-windows"')[0].split('chip-row')[-1])
+        self.assertNotIn('已按你的设备置顶', desk)
+
     def test_clients_page_renders_mirror_and_fallback(self):
         import pages
         clean = self.c.sanitize_manifest(_fake_manifest(), _MIRROR_BASE)
@@ -3145,6 +3184,10 @@ class ClientsHttpTests(AccountHarness):
         self.assertIn('去用户中心导入', html)
         self.assertIn('no-store', headers.get('Cache-Control', ''))
         self.assertIn('Content-Security-Policy', headers)
+        phone = dict(self._auth(ck), **{'User-Agent': 'Mozilla/5.0 (Linux; Android 14) Mobile'})
+        _, _, body = self._req('/clients', headers=phone)
+        html = body.decode()
+        self.assertLess(html.index('id="p-android"'), html.index('id="p-windows"'))
         _, _, body = self._req('/', headers=self._auth(ck))
         self.assertIn('href="/clients"', body.decode())
 

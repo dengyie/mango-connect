@@ -1616,11 +1616,38 @@ def _client_app(app: Dict[str, Any]) -> str:
             f'<div class="dl-rows">{rows}</div>{sha_block}</div>')
 
 
+_ANDROID_GUIDE = (
+    ('选哪个安装包', '近几年的手机选 <code>arm64-v8a</code>；不确定架构就选「通用包 universal」（体积大一些，任何手机都能装）；'
+                 'armeabi-v7a 只给老旧 32 位机型，x86_64 只给模拟器 / Chromebook。'),
+    ('允许安装', '下载完成后在通知栏或「文件管理 · 下载」里点开 APK，按提示允许浏览器「安装未知应用」；'
+               '小米 / 华为 / OPPO / vivo 的「纯净模式 / 安全守护」拦截时选「继续安装」或临时关闭。'),
+    ('首次连接', '在客户端里导入订阅并开启代理时，系统会弹出「网络连接请求（VPN）」，点「确定」。'),
+    ('防止掉线', '在系统「电池 / 应用启动管理」里把客户端设为「不限制」或允许后台运行，避免锁屏后被杀进程断网。'),
+    ('系统要求', 'FlClash / v2rayNG / sing-box 需 Android 7 及以上；Android 5–6 旧机请用 Clash Meta for Android '
+               '或 sing-box「Android 5–6 旧系统」通用包；华为 HarmonyOS NEXT（纯血鸿蒙）无法安装 APK。'),
+)
+
+
+_ANDROID_TIP = ('<div class="client-app"><p class="muted" style="margin:0">选包：近几年的手机选 <code>arm64-v8a</code>，'
+                '不确定就选「通用包 universal」；安装与防掉线步骤见本节末尾<a href="#android-guide">「Android 安装指引」</a>。</p></div>')
+
+
+def _android_guide() -> str:
+    steps = ''.join(f'<li><strong>{_esc(t)}</strong><span class="muted">{d}</span></li>'
+                    for t, d in _ANDROID_GUIDE)
+    return (f'<div class="client-app" id="android-guide"><div class="client-app-head"><strong>Android 安装指引</strong></div>'
+            f'<ol class="flow" style="margin-top:0">{steps}</ol></div>')
+
+
 def clients_page(manifest: Dict[str, Any], *, mirror_enabled: bool = False,
-                 role: str = 'user', logout_csrf: str = '') -> str:
+                 role: str = 'user', logout_csrf: str = '', device: str = '') -> str:
     """Members-only client download page: catalog grouped by platform, mirror
-    links from the download-site manifest, GitHub as fallback/alternative."""
+    links from the download-site manifest, GitHub as fallback/alternative.
+    `device` ('android' / 'ios', from the User-Agent) moves that platform to
+    the top so a phone visitor lands on their own installers."""
     view = clients.platform_view(manifest)
+    if device and any(p['key'] == device for p in view):
+        view.sort(key=lambda p: p['key'] != device)
     gen = float(manifest.get('generated') or 0)
     if manifest.get('apps'):
         status = _notice('ok', f'镜像同步于 {_esc(_fmt_ts(int(gen)))}：安装包与 GitHub 官方 release '
@@ -1629,21 +1656,26 @@ def clients_page(manifest: Dict[str, Any], *, mirror_enabled: bool = False,
         status = _notice('warn', '镜像暂不可用，下方链接指向各项目 GitHub 官方发布页。')
     else:
         status = ''
-    nav = ''.join(f'<a class="chip" href="#p-{p["key"]}">'
+    nav = ''.join(f'<a class="chip{" is-active" if p["key"] == device else ""}" href="#p-{p["key"]}">'
                   f'{_icon(_PLATFORM_ICON.get(p["key"], "monitor"), 13)}{_esc(p["label"])}</a>'
                   for p in view)
     sections = []
     for p in view:
         picks = [a['name'] for a in p['apps'] if a.get('recommended')]
-        note = f'<span class="faint">推荐 {_esc(" / ".join(picks))}</span>' if picks else ''
+        bits = (['已按你的设备置顶'] if device and p['key'] == device else []) \
+            + ([f'推荐 {" / ".join(picks)}'] if picks else [])
+        note = f'<span class="faint">{_esc(" · ".join(bits))}</span>' if bits else ''
         extra = ''
+        lead = _ANDROID_TIP if p['key'] == 'android' else ''
+        if p['key'] == 'android':
+            extra = _android_guide()
         if p['key'] == 'ios':
             extra = _notice('warn', '以上应用均未在中国大陆区 App Store 上架，需使用其他地区（如美区）Apple ID 购买 / 下载。')
             extra = f'<div class="client-app">{extra}</div>'
         sections.append(
             f'<section class="panel" id="p-{p["key"]}"><div class="panel-head"><h2>'
             f'{_icon(_PLATFORM_ICON.get(p["key"], "monitor"), 16)}{_esc(p["label"])}</h2>{note}</div>'
-            + ''.join(_client_app(a) for a in p['apps']) + extra + '</section>')
+            + lead + ''.join(_client_app(a) for a in p['apps']) + extra + '</section>')
     action = f'<a class="btn" href="/dashboard">{_icon("user", 15)}去用户中心导入</a>'
     body = f"""
   {_page_head('客户端下载', eyebrow='下载', eyebrow_icon='download',

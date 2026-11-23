@@ -924,7 +924,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         tok, setc = self._csrf_pair()
         html_body = pages.clients_page(CLIENTS.get(), mirror_enabled=CLIENTS.enabled,
-                                       role=str(user.get('role') or 'user'), logout_csrf=tok)
+                                       role=str(user.get('role') or 'user'), logout_csrf=tok,
+                                       device=clients.detect_platform(self.headers.get('User-Agent', '')))
         headers = self._page_headers(self._slide_session_cookie(user), setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
                    headers=headers)

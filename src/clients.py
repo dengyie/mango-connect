@@ -106,6 +106,7 @@ CATALOG: Tuple[App, ...] = (
         'clash', recommended=('android',), assets=(
             Asset('android-arm64', 'android', 'arm64-v8a（绝大多数手机）', rf'^FlClash-{V}-android-arm64-v8a\.apk$'),
             Asset('android-armv7', 'android', 'armeabi-v7a（老旧 32 位机型）', rf'^FlClash-{V}-android-armeabi-v7a\.apk$'),
+            Asset('android-x86_64', 'android', 'x86_64（模拟器 / Chromebook）', rf'^FlClash-{V}-android-x86_64\.apk$'),
             Asset('windows-x64', 'windows', 'x64 安装包', rf'^FlClash-{V}-windows-amd64-setup\.exe$'),
             Asset('macos-arm64', 'macos', 'Apple 芯片 (M 系列)', rf'^FlClash-{V}-macos-arm64\.dmg$'),
             Asset('macos-x64', 'macos', 'Intel 芯片', rf'^FlClash-{V}-macos-amd64\.dmg$'),
@@ -116,11 +117,17 @@ CATALOG: Tuple[App, ...] = (
         'clash', assets=(
             Asset('android-arm64', 'android', 'arm64-v8a（绝大多数手机）', rf'^cmfa-{V}-meta-arm64-v8a-release\.apk$'),
             Asset('android-armv7', 'android', 'armeabi-v7a（老旧 32 位机型）', rf'^cmfa-{V}-meta-armeabi-v7a-release\.apk$'),
+            Asset('android-universal', 'android', '通用包 universal（不确定架构选这个）', rf'^cmfa-{V}-meta-universal-release\.apk$'),
+            Asset('android-x86_64', 'android', 'x86_64（模拟器 / Chromebook）', rf'^cmfa-{V}-meta-x86_64-release\.apk$'),
         )),
     App('sing-box', 'sing-box', 'SagerNet/sing-box',
         'sing-box 官方图形客户端（SFA / SFM / SFW / SFL），使用本站 Sing-Box JSON 订阅。',
         'singbox', assets=(
-            Asset('android-arm64', 'android', 'SFA · arm64-v8a', rf'^SFA-{V}-arm64-v8a\.apk$'),
+            Asset('android-arm64', 'android', 'SFA · arm64-v8a（Android 7+）', rf'^SFA-{V}-arm64-v8a\.apk$'),
+            Asset('android-armv7', 'android', 'SFA · armeabi-v7a（Android 7+）', rf'^SFA-{V}-armeabi-v7a\.apk$'),
+            Asset('android-universal', 'android', 'SFA · 通用包 universal（Android 7+）', rf'^SFA-{V}-universal\.apk$'),
+            Asset('android-legacy-universal', 'android', 'SFA · 通用包（Android 5–6 旧系统）',
+                  rf'^SFA-{V}-legacy-android-5-universal\.apk$'),
             Asset('windows-x64', 'windows', 'SFW · x64', rf'^SFW-{V}-x64\.exe$'),
             Asset('macos-arm64', 'macos', 'SFM · Apple 芯片', rf'^SFM-{V}-Apple\.pkg$'),
             Asset('macos-x64', 'macos', 'SFM · Intel 芯片', rf'^SFM-{V}-Intel\.pkg$'),
@@ -136,6 +143,8 @@ CATALOG: Tuple[App, ...] = (
         'uri', assets=(
             Asset('android-arm64', 'android', 'arm64-v8a', rf'^v2rayNG_{V}_arm64-v8a\.apk$'),
             Asset('android-armv7', 'android', 'armeabi-v7a', rf'^v2rayNG_{V}_armeabi-v7a\.apk$'),
+            Asset('android-universal', 'android', '通用包 universal（不确定架构选这个）', rf'^v2rayNG_{V}_universal\.apk$'),
+            Asset('android-x86_64', 'android', 'x86_64（模拟器 / Chromebook）', rf'^v2rayNG_{V}_x86_64\.apk$'),
         )),
 )
 
@@ -298,6 +307,17 @@ class ManifestCache:
             except OSError:
                 pass
         return True
+
+
+def detect_platform(user_agent: str) -> str:
+    """Best-effort phone platform from a User-Agent ('android' / 'ios' /
+    ''); only used to put the visitor's own platform first on the page."""
+    ua = user_agent or ''
+    if 'Android' in ua:
+        return 'android'
+    if any(t in ua for t in ('iPhone', 'iPad', 'iPod')):
+        return 'ios'
+    return ''
 
 
 def fmt_size(n: int) -> str:
