@@ -6,7 +6,7 @@ people. Each person gets their own revocable token, an account with a quota and
 an expiry date, and a dashboard. Nothing in the gateway's own credentials or
 topology is ever exposed.
 
-Pure Python standard library (3.8+), with no third-party runtime dependencies,
+Python 3.10+ with a single dependency (PyYAML, `pip install -r requirements.txt`),
 no build step and no external assets. Pages are server-rendered and fully
 self-contained: every CSS and JS asset is inline, under a strict CSP.
 
