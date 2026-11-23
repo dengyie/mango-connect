@@ -170,6 +170,8 @@ def save(path: Path, records: List[Dict[str, Any]]) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(records, ensure_ascii=False, indent=2) + '\n')
+            f.flush()
+            os.fsync(f.fileno())  # replace() must never expose an empty file after a crash
         os.chmod(tmp, USER_MODE)
         # Preserve ownership across the atomic replace (a root-run CLI must
         # not leave the store unreadable for the unprivileged service, the
@@ -546,31 +548,60 @@ def _append_ingest_log(log_path: Path, lines: List[str]) -> None:
 
 # ---------------------------------------------------------------- sessions
 
+_SECRET_CACHE: Dict[str, tuple] = {}
+
+
 def load_secret(env: Optional[Dict[str, str]] = None) -> bytes:
     """Read secret.key, generating it (0600, ownership follows the state dir)
     on first use. Generation is serialized by the sidecar flock so two cold
     concurrent requests cannot mint different secrets. The file only ever
-    holds random bytes."""
+    holds random bytes.
+
+    The secret signs every session, export link and derived token, so it is
+    only ever minted when the file is ABSENT: a transient read error or a
+    damaged file raises instead of silently rotating it (which would log
+    everyone out and break every copied export link). Creation is atomic
+    (tmp + fsync + rename). Reads are cached per (path, mtime, size): this
+    runs on most requests and must not take a flock each time."""
     path = secret_file(env)
+    key = str(path)
+    try:
+        st = path.stat()
+        hit = _SECRET_CACHE.get(key)
+        if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+            return hit[1]
+    except FileNotFoundError:
+        pass
     with locked(path):
         try:
             data = path.read_bytes().strip()
-            if len(data) >= 64:
-                return bytes.fromhex(data.decode('ascii'))
-        except (OSError, ValueError):
-            pass
+        except FileNotFoundError:
+            data = None
+        if data is not None:
+            try:
+                raw = bytes.fromhex(data.decode('ascii'))
+            except ValueError:
+                raw = b''
+            if len(raw) < 32:
+                raise RuntimeError(f'{path} is damaged; restore it from a state snapshot')
+            st = path.stat()
+            _SECRET_CACHE[key] = ((st.st_mtime_ns, st.st_size), raw)
+            return raw
         raw = secrets.token_bytes(48)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_MODE)
+        tmp = path.with_name(path.name + '.new')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_MODE)
         try:
             os.write(fd, raw.hex().encode('ascii'))
+            os.fsync(fd)
         finally:
             os.close(fd)
         try:
             st = path.parent.stat()
-            os.chown(path, st.st_uid, st.st_gid)
+            os.chown(tmp, st.st_uid, st.st_gid)
         except (PermissionError, OSError):
             pass
+        os.replace(tmp, path)
         return raw
 
 

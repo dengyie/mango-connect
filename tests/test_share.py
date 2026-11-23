@@ -555,12 +555,13 @@ class ConverterRuleTests(unittest.TestCase):
                        'outbound': 'DIRECT'}, cfg['route']['rules'])
         self.assertIn({'ip_cidr': ['10.0.0.0/8'], 'outbound': 'DIRECT'},
                       cfg['route']['rules'])
+        # Surge/QX have no LAN geoip set either: expanded to private ranges
         surge, _ = fc.to_surge(clash)
-        self.assertIn('GEOIP,LAN,DIRECT,no-resolve', surge)
-        self.assertNotIn('GEOIP,LAN,PROXY', surge)
+        self.assertIn('IP-CIDR,192.168.0.0/16,DIRECT,no-resolve', surge)
+        self.assertNotIn('GEOIP,LAN', surge)
         qx, _ = fc.to_qx(clash)
-        self.assertIn('GEOIP,LAN,direct', qx)
-        self.assertNotIn('GEOIP,LAN,proxy', qx)
+        self.assertIn('ip-cidr, 192.168.0.0/16, direct', qx)
+        self.assertNotIn('GEOIP,LAN', qx)
 
     def test_match_target_respected(self):
         fc = self.fc
@@ -620,6 +621,156 @@ class ConverterRuleTests(unittest.TestCase):
         text, skipped = fc.to_surge(clash)
         self.assertNotIn('a,b=c', text)
         self.assertTrue(any('unrepresentable' in r for _n, r in skipped))
+
+
+class ConverterFidelityTests(unittest.TestCase):
+    """2026-11-23 deep review: group resolution, relay chains, always-TLS
+    protocols, sing-box 1.12 schema, URI parameter fidelity."""
+
+    @classmethod
+    def setUpClass(cls):
+        import format_converters as fc
+        cls.fc = fc
+
+    def _clash(self):
+        return {'proxies': [
+            {'name': 'relay', 'type': 'trojan', 'server': 'r.example', 'port': 443,
+             'password': 'p,w', 'sni': 'r.example'},
+            {'name': 'chained', 'type': 'ss', 'server': '9.9.9.9', 'port': 8388,
+             'cipher': 'aes-128-gcm', 'password': 'x', 'dialer-proxy': 'relay'},
+            {'name': 'orphan', 'type': 'ss', 'server': '8.8.8.8', 'port': 1,
+             'cipher': 'aes-128-gcm', 'password': 'x', 'dialer-proxy': 'gone'},
+            {'name': 'hy', 'type': 'hysteria2', 'server': 'h.example', 'port': 443,
+             'password': 'pw', 'ports': '20000-30000', 'skip-cert-verify': True},
+            {'name': 'tu', 'type': 'tuic', 'server': '3.3.3.3', 'port': 443,
+             'uuid': 'U', 'password': 'P', 'sni': 't.example', 'alpn': ['h3']},
+            {'name': 'mi', 'type': 'mieru', 'server': '4.4.4.4', 'port': 1, 'password': 'p'},
+            {'name': 'bad', 'type': 'ss', 'server': '5.5.5.5', 'port': 'x'},
+            {'name': 'vw', 'type': 'vmess', 'server': 'v.example', 'port': 443,
+             'uuid': 'V', 'cipher': 'auto', 'tls': True, 'servername': 'v.example',
+             'network': 'ws', 'ws-opts': {'path': '/ws', 'headers': {'Host': 'v.example'}}},
+            {'name': 'rl', 'type': 'vless', 'server': '1.2.3.4', 'port': 443, 'uuid': 'U1',
+             'tls': True, 'servername': 'apple.com', 'flow': 'xtls-rprx-vision',
+             'reality-opts': {'public-key': 'PBK', 'short-id': '01'}},
+        ], 'proxy-groups': [
+            # PROXY references AUTO before AUTO is declared
+            {'name': 'PROXY', 'type': 'select', 'proxies': ['AUTO', 'hy', 'DIRECT']},
+            {'name': 'AUTO', 'type': 'url-test', 'proxies': ['hy', 'tu', 'mi']},
+            {'name': 'EMPTY', 'type': 'select', 'proxies': ['mi', 'orphan']},
+            {'name': 'USES-EMPTY', 'type': 'select', 'proxies': ['EMPTY']},
+        ], 'rules': ['DOMAIN,ads.example,REJECT', 'DST-PORT,25,REJECT',
+                     'GEOIP,CN,DIRECT', 'DOMAIN,x.example,EMPTY',
+                     'IP-CIDR,1.0.0.0/8,DIRECT,src', 'MATCH,PROXY']}
+
+    def test_singbox_groups_resolved_to_fixed_point(self):
+        cfg, skipped = self.fc.to_singbox(self._clash())
+        obs = {o['tag']: o for o in cfg['outbounds']}
+        self.assertEqual(obs['PROXY']['outbounds'], ['AUTO', 'hy', 'DIRECT'])
+        self.assertEqual(obs['AUTO']['outbounds'], ['hy', 'tu'])
+        self.assertNotIn('EMPTY', obs)
+        self.assertNotIn('USES-EMPTY', obs)
+        self.assertNotIn('mi', obs)
+        self.assertNotIn('bad', obs)
+        names = dict(skipped)
+        self.assertIn('mi', names)
+        self.assertIn('bad', names)
+
+    def test_singbox_relay_chain_becomes_detour(self):
+        cfg, skipped = self.fc.to_singbox(self._clash())
+        obs = {o['tag']: o for o in cfg['outbounds']}
+        self.assertEqual(obs['chained']['detour'], 'relay')
+        self.assertNotIn('orphan', obs)
+        self.assertIn('relay gone unavailable', dict(skipped)['orphan'])
+
+    def test_singbox_always_tls_protocols(self):
+        cfg, _ = self.fc.to_singbox(self._clash())
+        obs = {o['tag']: o for o in cfg['outbounds']}
+        self.assertEqual(obs['hy']['tls'], {'enabled': True, 'server_name': 'h.example',
+                                            'insecure': True, 'alpn': ['h3']})
+        self.assertEqual(obs['hy']['server_ports'], ['20000:30000'])
+        self.assertEqual(obs['tu']['tls']['server_name'], 't.example')
+        self.assertNotIn('alpn', obs['tu'])  # alpn belongs to the tls block
+        self.assertTrue(obs['relay']['tls']['enabled'])
+        self.assertEqual(obs['rl']['tls']['utls']['fingerprint'], 'chrome')
+
+    def test_singbox_112_schema(self):
+        cfg, _ = self.fc.to_singbox(self._clash())
+        rules = cfg['route']['rules']
+        self.assertIn({'domain': ['ads.example'], 'action': 'reject'}, rules)
+        self.assertIn({'port': [25], 'action': 'reject'}, rules)
+        self.assertIn({'rule_set': ['geoip-cn'], 'outbound': 'DIRECT'}, rules)
+        self.assertFalse(any('geoip' in r for r in rules))
+        self.assertFalse(any(r.get('ip_cidr') == ['1.0.0.0/8'] for r in rules))
+        self.assertFalse(any(r.get('domain') == ['x.example'] for r in rules))
+        self.assertEqual(cfg['route']['rule_set'][0]['tag'], 'geoip-cn')
+        self.assertEqual(cfg['route']['default_domain_resolver'], 'local')
+        for srv in cfg['dns']['servers']:
+            self.assertIn('type', srv)
+            self.assertNotIn('address', srv)
+        self.assertNotIn('block', {o['type'] for o in cfg['outbounds']})
+
+    def test_surge_groups_and_protocols(self):
+        text, skipped = self.fc.to_surge(self._clash(), managed_url='https://h/sub/T?fmt=surge')
+        self.assertTrue(text.startswith('#!MANAGED-CONFIG https://h/sub/T?fmt=surge'))
+        self.assertIn('PROXY = select, AUTO, hy, DIRECT', text)  # DIRECT not first
+        self.assertIn('AUTO = url-test, hy, tu, url=', text)
+        self.assertIn('hy = hysteria2, h.example, 443, password=pw, skip-cert-verify=true', text)
+        self.assertIn('tu = tuic-v5, 3.3.3.3, 443, password=P, uuid=U, alpn=h3, sni=t.example', text)
+        self.assertIn('vw = vmess, v.example, 443, username=V, ws=true, ws-path=/ws, '
+                      'ws-headers=Host:v.example, tls=true, sni=v.example, vmess-aead=true', text)
+        self.assertIn('DOMAIN,ads.example,REJECT', text)
+        self.assertIn('DEST-PORT,25,REJECT', text)
+        self.assertNotIn('= shadowsocks', text)
+        # the relay's password carries the delimiter -> relay and its chain go
+        self.assertIn('relay', dict(skipped))
+        self.assertIn('chained', dict(skipped))
+
+    def test_surge_underlying_proxy(self):
+        clash = {'proxies': [
+            {'name': 'r', 'type': 'ss', 'server': 's', 'port': 1, 'cipher': 'c', 'password': 'p'},
+            {'name': 'c', 'type': 'ss', 'server': 't', 'port': 2, 'cipher': 'c', 'password': 'p',
+             'dialer-proxy': 'r'}], 'proxy-groups': [], 'rules': []}
+        text, _ = self.fc.to_surge(clash)
+        self.assertIn('c = ss, t, 2, encrypt-method=c, password=p, underlying-proxy=r', text)
+        self.assertIn('PROXY = select, r, c, DIRECT', text)
+
+    def test_qx_policies_and_obfs(self):
+        text, skipped = self.fc.to_qx(self._clash())
+        self.assertNotIn('url-latency-benchmark=AUTO', text)  # hy/tu unsupported -> AUTO empty
+        self.assertIn('vmess=v.example:443, method=chacha20-ietf-poly1305, password=V, '
+                      'obfs=wss, obfs-uri=/ws, obfs-host=v.example, aead=true', text)
+        self.assertIn('host, ads.example, reject', text)
+        self.assertIn('final, proxy', text)
+        self.assertNotIn('[rule]', text)
+        self.assertIn('chained', dict(skipped))
+
+    def test_uri_fidelity(self):
+        import base64 as _b64
+        from urllib.parse import parse_qs, unquote, urlsplit
+        body, skipped = self.fc.to_uri_list(self._clash())
+        uris = _b64.b64decode(body).decode().split()
+        by = {unquote(urlsplit(u).fragment): u for u in uris if not u.startswith('vmess://')}
+        q = parse_qs(urlsplit(by['rl']).query)
+        self.assertEqual(q['security'], ['reality'])
+        self.assertEqual(q['pbk'], ['PBK'])
+        self.assertEqual(q['encryption'], ['none'])
+        self.assertEqual(q['type'], ['tcp'])
+        self.assertEqual(q['fp'], ['chrome'])
+        self.assertTrue(by['relay'].startswith('trojan://p%2Cw@r.example:443?'))
+        hq = parse_qs(urlsplit(by['hy']).query)
+        self.assertEqual(hq['insecure'], ['1'])
+        self.assertEqual(hq['mport'], ['20000-30000'])
+        vm = [u for u in uris if u.startswith('vmess://')][0]
+        payload = json.loads(_b64.b64decode(vm[8:]))
+        self.assertEqual((payload['ps'], payload['net'], payload['path'], payload['host']),
+                         ('vw', 'ws', '/ws', 'v.example'))
+        self.assertIn('chained', dict(skipped))  # relay chains: no URI form
+        ss = self.fc._uri_for({'name': 'a b', 'type': 'ss', 'server': '::1', 'port': 1,
+                               'cipher': 'aes-128-gcm', 'password': '>>>?'})
+        self.assertTrue(ss.startswith('ss://'))
+        self.assertIn('@[::1]:1#a%20b', ss)
+        self.assertNotIn('+', ss.split('@')[0])
+        self.assertNotIn('/', ss.split('@')[0][5:])
 
 
 class UserUnitTests(unittest.TestCase):
@@ -841,11 +992,12 @@ class UserUnitTests(unittest.TestCase):
         self.assertEqual(cfg['route']['final'], 'PROXY')
         surge, sk = fc.to_surge(clash)
         self.assertIn('home-mesh = http, 10.144.144.10, 8082', surge)
-        self.assertTrue(any('vless has no Surge equivalent' for _, m in sk))
+        self.assertIn('aws-reality', dict(sk))  # reality: no Surge equivalent
         self.assertIn('FINAL,PROXY', surge)
         qx, _ = fc.to_qx(clash)
         self.assertIn('vmess=5.5.5.5:80', qx)
-        self.assertIn('DOMAIN-SUFFIX,claude.ai,proxy', qx)
+        self.assertIn('[filter_local]', qx)
+        self.assertIn('host-suffix, claude.ai, proxy', qx)
         uri, _ = fc.to_uri_list(clash)
         decoded = _b64.b64decode(uri).decode()
         self.assertIn('vless://U1@1.2.3.4:443', decoded)
@@ -2160,6 +2312,188 @@ class Review7Tests(AccountHarness):
         import state_backup as sb
         out = sb.pack(dict(os.environ), Path(self.tmp.name) / 'out/pack.tar.gz')
         self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+
+def quote_plain(u):
+    from urllib.parse import quote
+    return quote(u, safe='')
+
+
+class Review8Tests(AccountHarness):
+    """Eighth review batch: POST framing, numeric guards, CSV injection,
+    cookie preservation on slide, proxy-header trust, /info fallback."""
+
+    def _raw(self, payload: bytes) -> bytes:
+        import socket
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as sk:
+            sk.sendall(payload)
+            chunks = []
+            while True:
+                try:
+                    b = sk.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+            return b''.join(chunks)
+
+    def test_oversized_post_closes_connection(self):
+        body = b'x' * 5000
+        resp = self._raw(b'POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n' + body)
+        self.assertTrue(resp.startswith(b'HTTP/1.1 413'), resp[:40])
+        # exactly one response: the unread body was not parsed as a request
+        self.assertEqual(resp.count(b'HTTP/1.1 '), 1)
+
+    def test_chunked_post_is_refused(self):
+        resp = self._raw(b'POST /login HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'
+                         b'5\r\nhello\r\n0\r\n\r\n')
+        self.assertTrue(resp.startswith(b'HTTP/1.1 411'), resp[:40])
+        self.assertEqual(resp.count(b'HTTP/1.1 '), 1)
+
+    def test_non_finite_numbers_are_rejected_not_500(self):
+        ck, csrf = self._login()
+        for q in ('inf', 'nan', '1e400'):
+            data = (f'csrf={csrf}&username=n{q[:2]}x&password=demopass123'
+                    f'&quota_gb={q}&expire_days=0&reset_day=1&notes=').encode()
+            status, headers, _ = self._req('/admin/users', data=data, headers=self._auth(ck))
+            self.assertEqual(status, 303, q)
+            self.assertIn('/admin?err=', headers.get('Location', ''))
+        self._create_demo_user(ck, csrf)
+        uid = self._demo()['id']
+        for action in ('set-quota', 'set-expire'):
+            status, headers, _ = self._req(
+                f'/admin/users/{uid}/action',
+                data=f'csrf={csrf}&action={action}&value=inf'.encode(),
+                headers=self._auth(ck))
+            self.assertEqual(status, 303, action)
+            self.assertIn('/admin?err=', headers.get('Location', ''))
+
+    def test_reset_password_scrypt_busy_is_handled(self):
+        ck, csrf = self._login()
+        self._create_demo_user(ck, csrf)
+        uid = self._demo()['id']
+        orig = self.us.set_password
+
+        def busy(*a, **k):
+            raise self.us.ScryptBusy()
+        self.us.set_password = busy
+        try:
+            status, headers, _ = self._req(
+                f'/admin/users/{uid}/action',
+                data=f'csrf={csrf}&action=reset-password&value=newpass1234'.encode(),
+                headers=self._auth(ck))
+        finally:
+            self.us.set_password = orig
+        self.assertEqual(status, 303)
+        self.assertIn('/admin?err=', headers.get('Location', ''))
+
+    def test_audit_csv_neutralises_formulas(self):
+        import server as srv_mod
+        self.assertEqual(srv_mod._csv_cell('=HYPERLINK("x")'), '\'=HYPERLINK("x")')
+        self.assertEqual(srv_mod._csv_cell('@SUM(A1)'), "'@SUM(A1)")
+        self.assertEqual(srv_mod._csv_cell('alice'), 'alice')
+        self.us.append_audit({'actor': '=cmd|calc', 'action': 'login.fail', 'ip': '1.1.1.1'})
+        ck, _ = self._login()
+        status, _, body = self._req('/admin/audit/export', headers=self._auth(ck))
+        self.assertEqual(status, 200)
+        self.assertIn(b"'=cmd|calc", body)
+        self.assertNotIn(b',=cmd', body)
+
+    def test_slide_keeps_fresh_csrf_cookie(self):
+        import server as srv_mod
+        h = srv_mod.Handler.__new__(srv_mod.Handler)
+        headers = h._page_headers('mango_session=a', 'mango_csrf=b')
+        cookies = [v for k, v in headers if k == 'Set-Cookie']
+        self.assertEqual(cookies, ['mango_session=a', 'mango_csrf=b'])
+        headers = h._page_headers(None, None)
+        self.assertFalse([v for k, v in headers if k == 'Set-Cookie'])
+
+    def test_cf_connecting_ip_only_trusted_from_loopback(self):
+        import server as srv_mod
+        h = srv_mod.Handler.__new__(srv_mod.Handler)
+        h.headers = {'CF-Connecting-IP': '8.8.8.8'}
+        h.client_address = ('127.0.0.1', 1)
+        self.assertEqual(h._client_ip(), '8.8.8.8')
+        h.client_address = ('203.0.113.9', 1)
+        self.assertEqual(h._client_ip(), '203.0.113.9')
+
+    def test_client_deep_links_use_native_formats(self):
+        import base64
+        import pages
+        from urllib.parse import unquote
+        url = 'https://x.example/sub/export?u=1&e=2&k=3&s=4'
+        links = dict(pages._client_links(url))
+        self.assertIn(quote_plain(url + '&fmt=surge'), links['Surge'])
+        self.assertIn('fmt=qx', unquote(links['Quantumult X']))
+        rocket = links['Shadowrocket'].removeprefix('sub://')
+        self.assertEqual(base64.urlsafe_b64decode(rocket + '=' * (-len(rocket) % 4)).decode(), url)
+        self.assertNotIn('fmt=', unquote(links['Clash / Mihomo']))
+
+    def test_export_link_carries_userinfo_and_surge_managed_header(self):
+        ck, csrf = self._login()
+        self._create_demo_user(ck, csrf, quota_gb='10')
+        path = self._export_url_for(self._demo())
+        status, headers, _ = self._req(path)
+        self.assertEqual(status, 200)
+        self.assertIn('total=', headers.get('subscription-userinfo', ''))
+        status, _, body = self._req(path + '&fmt=surge')
+        self.assertEqual(status, 200)
+        self.assertTrue(body.startswith(b'#!MANAGED-CONFIG '), body[:60])
+
+    def test_info_serves_last_good_meta_when_render_fails(self):
+        import server as srv_mod
+        ck, csrf = self._login()
+        token = self._create_demo_user(ck, csrf)
+        status, _, body = self._req(f'/info/{token}')
+        self.assertEqual(status, 200)
+        good = json.loads(body)
+        orig = srv_mod.STATE.ensure_fresh
+
+        def broken():
+            raise RuntimeError('render exploded')
+        srv_mod.STATE.ensure_fresh = broken
+        try:
+            status, _, body = self._req(f'/info/{token}')
+        finally:
+            srv_mod.STATE.ensure_fresh = orig
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['node_count'], good['node_count'])
+
+
+class SecretKeyTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+        import users as us
+        self.us = us
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = {'SHARE_STATE_DIR': self.tmp.name}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_generated_once_and_stable(self):
+        a = self.us.load_secret(self.env)
+        b = self.us.load_secret(self.env)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 48)
+        p = self.us.secret_file(self.env)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(p.with_name(p.name + '.new').exists())
+
+    def test_damaged_secret_raises_instead_of_rotating(self):
+        p = self.us.secret_file(self.env)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('abc', encoding='ascii')
+        with self.assertRaises(RuntimeError):
+            self.us.load_secret(self.env)
+        self.assertEqual(p.read_text(encoding='ascii'), 'abc')
+
+    def test_token_ids_never_collide(self):
+        import tokens as tk
+        path = Path(self.tmp.name) / 'tokens.json'
+        ids = {tk.create_token(path, 'same')[0]['id'] for _ in range(30)}
+        self.assertEqual(len(ids), 30)
 
 
 class _FakeGateway:

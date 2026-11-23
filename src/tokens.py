@@ -104,6 +104,8 @@ def save(path: Path, records: List[Dict[str, Any]]) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(records, ensure_ascii=False, indent=2) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, TOKEN_MODE)
         # Preserve ownership across the atomic replace: the CLI may run as
         # root while the service runs as an unprivileged user; without this,
@@ -229,8 +231,9 @@ def create_token(path: Path, name: str, owner: str = '',
         if owner:
             rec['owner'] = str(owner)
         ids = {r.get('id') for r in records}
-        if rec['id'] in ids:
-            rec['id'] = f"{rec['id']}-{secrets.token_hex(2)}"
+        base = rec['id']
+        while rec['id'] in ids:  # a single random suffix can collide too
+            rec['id'] = f"{base}-{secrets.token_hex(3)}"
         records.append(rec)
         save(path, records)
     return rec, token

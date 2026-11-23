@@ -93,6 +93,9 @@ for m in ("share_constants", "state_backup", "users", "tokens", "notify",
   for d in src scripts assets; do
     [[ -d $STATE/$d ]] && cp -a "$STATE/$d" "$backup/"
   done
+  # A rollback that restores nothing would turn a bad release into an
+  # outage: refuse to deploy without a usable backup.
+  [[ -f $backup/src/server.py ]] || die "backup $backup has no src/server.py; refusing to deploy"
   log "backup -> $backup"
 
   install_tree() {
@@ -129,22 +132,28 @@ for m in ("share_constants", "state_backup", "users", "tokens", "notify",
     return 1
   }
 
-  install_tree "$work/new"
-  log "restarting $PROGRAM"
-  if restart_and_wait; then
-    echo "$sha" > "$STATE/.release.ci-new" && mv -f "$STATE/.release.ci-new" "$STATE/.release"
-    log "release $sha healthy"
-  else
-    log "health gate FAILED - rolling back to $backup"
+  rollback() {
+    log "$1 - rolling back to $backup"
     supervisorctl tail "$PROGRAM" stderr 2>/dev/null | tail -20 || tail -20 "$STATE/logs/mango-share.log" || true
     rm -f "$STATE"/src/*.py
-    install_tree "$backup"
+    install_tree "$backup" || log "restoring backup files failed"
     if restart_and_wait; then
       log "rollback healthy"
     else
       log "rollback ALSO unhealthy - manual recovery required"
     fi
     exit 1
+  }
+
+  # A failure halfway through the copy (disk full, NFS hiccup) leaves a mixed
+  # tree: roll back instead of letting `set -e` exit with it in place.
+  ( set -e; install_tree "$work/new" ) || rollback "install failed"
+  log "restarting $PROGRAM"
+  if restart_and_wait; then
+    echo "$sha" > "$STATE/.release.ci-new" && mv -f "$STATE/.release.ci-new" "$STATE/.release"
+    log "release $sha healthy"
+  else
+    rollback "health gate FAILED"
   fi
 
   ls -1dt "$STATE"/rollback/ci-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -rf
@@ -154,8 +163,11 @@ for m in ("share_constants", "state_backup", "users", "tokens", "notify",
 exec 9>"$LOCK"
 flock -w 120 9 || die "another deploy holds $LOCK"
 
-# Forced-command mode: the client's requested command arrives here.
+# Forced-command mode: the client's requested command arrives here. Split on
+# whitespace only: no glob expansion of client-supplied words.
+set -f
 set -- ${SSH_ORIGINAL_COMMAND:-${*:-status}}
+set +f
 case "${1:-status}" in
   deploy) [[ $# -eq 2 ]] || die "usage: deploy <sha>"; deploy "$2" ;;
   status) status ;;

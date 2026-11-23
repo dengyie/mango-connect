@@ -15,12 +15,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -166,10 +168,20 @@ class ShareState:
                     if n['alive'] and n['delay']:
                         _GATEWAY_VERDICT[n['name']] = (now, n['delay'])
         except Exception as e:  # stale cache beats a hard error for the page
-            err = f'gateway unreachable: {e}'
+            # Detail goes to the log only: exception text can carry the
+            # controller URL or filesystem paths.
+            sys.stderr.write(f'mango-share gateway fetch failed: {e!r}\n')
+            err = 'gateway unreachable'
         with _GATEWAY_CACHE_LOCK:
-            _GATEWAY_CACHE.update(ts=now, nodes=nodes)
-        if not nodes and not _GATEWAY_CACHE['nodes']:
+            if nodes:
+                _GATEWAY_CACHE.update(ts=now, nodes=nodes)
+            else:
+                # Keep the last good rows (marked stale by the error) and
+                # back off for a few seconds instead of hammering a dead
+                # controller on every page view.
+                nodes = list(_GATEWAY_CACHE['nodes'])
+                _GATEWAY_CACHE['ts'] = now - 10 if nodes else 0
+        if not nodes:
             return [], err
         _schedule_reprobe(list(nodes))
         return _overlay_verdicts(list(nodes)), err
@@ -196,6 +208,21 @@ class ShareState:
 
 
 STATE = ShareState()
+
+
+def _csv_cell(value) -> str:
+    """Neutralise spreadsheet formula injection: audit fields carry
+    user-controlled text (usernames, login attempts), and a cell starting
+    with = + - @ (or tab/CR) is executed by Excel/Sheets on open."""
+    text = '' if value is None else str(value)
+    if text and text[0] in '=+-@\t\r':
+        return "'" + text
+    return text
+
+# fmt conversion memo: (sha256(body), fmt, managed_url) -> bytes, LRU-bounded
+_CONVERT_CACHE: 'OrderedDict[tuple, bytes]' = OrderedDict()
+_CONVERT_CACHE_MAX = 16
+_CONVERT_LOCK = threading.Lock()
 
 # Gateway controller (mihomo) for the live node-status page. Secret file is
 # group-readable by the service user; responses cached 15s to keep /proxies load
@@ -381,14 +408,20 @@ class Handler(BaseHTTPRequestHandler):
             lambda mm: mm.group(1) + (path[len(mm.group(1)):len(mm.group(1)) + 4] + '…' if len(path) > len(mm.group(1)) else ''),
             path,
         )
-        sys.stderr.write('mango-share %s %s %s\n' % (command, redacted, code))
+        sys.stderr.write('%s mango-share %s %s %s\n' % (
+            time.strftime('%Y-%m-%dT%H:%M:%S'), command, redacted, code))
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: N802
         # Fallback path: BaseHTTPRequestHandler sends arbitrary format strings
         # here (e.g. send_error). Nothing in them may contain a full token
         # because the token only ever appears in the URL path, which we never
         # pass through unredacted.
-        sys.stderr.write('mango-share %s\n' % (fmt % args))
+        msg = fmt % args
+        if msg.startswith('Request timed out'):
+            return  # idle keep-alive socket hitting `timeout`: not an error
+        # send_error() may echo the request line: redact tokens here too.
+        msg = self._TOKEN_IN_PATH.sub(lambda mm: mm.group(1) + '…', msg)
+        sys.stderr.write('%s mango-share %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S'), msg))
 
     def _token(self) -> str:
         parts = urlsplit(self.path).path.split('/')
@@ -464,11 +497,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get('Content-Length') or 0)
             except ValueError:
+                self.close_connection = True
                 self._send(400, b'{"error":"bad content-length"}')
+                return
+            if self.headers.get('Transfer-Encoding'):
+                # Chunked bodies are never read here; leaving them on the
+                # socket would desync the keep-alive stream.
+                self.close_connection = True
+                self._send(411, b'{"error":"length required"}')
                 return
             if length < 0 or length > limit:
                 err = b'{"error":"payload too large"}' if length > limit \
                     else b'{"error":"bad content-length"}'
+                self.close_connection = True  # unread body stays on the socket
                 self._send(413 if length > limit else 400, err)
                 return
             raw = self.rfile.read(length) if length else b''
@@ -544,11 +585,16 @@ class Handler(BaseHTTPRequestHandler):
         return '; '.join(parts)
 
     def _client_ip(self) -> str:
-        # CF-Connecting-IP is set by the Cloudflare edge on this ingress and
-        # cannot be injected by clients; X-Forwarded-For is forgeable on the
-        # same chain, so it must never be consulted for rate-limit keys.
-        cip = (self.headers.get('CF-Connecting-IP') or '').strip()
-        return cip or (self.client_address[0] if self.client_address else '')
+        # CF-Connecting-IP is set by the Cloudflare edge and arrives via the
+        # local tunnel daemon, i.e. from a loopback peer. A direct (non-
+        # loopback) peer could forge it to dodge rate limits, so only trust
+        # it from loopback. X-Forwarded-For is never consulted.
+        peer = self.client_address[0] if self.client_address else ''
+        if peer in ('127.0.0.1', '::1') or peer.startswith('127.'):
+            cip = (self.headers.get('CF-Connecting-IP') or '').strip()
+            if cip:
+                return cip[:64]
+        return peer
 
     def _current_user(self) -> dict | None:
         self._session_payload = None
@@ -609,6 +655,19 @@ class Handler(BaseHTTPRequestHandler):
     def _field(form: dict, name: str) -> str:
         return (form.get(name) or [''])[0]
 
+    @staticmethod
+    def _num(raw: str, default: float, hi: float) -> float:
+        """Admin numeric field: blank -> default; non-finite ('inf', 'nan')
+        or absurdly large values raise ValueError instead of overflowing in
+        int() further down (that used to surface as a 500)."""
+        raw = (raw or '').strip()
+        if not raw:
+            return default
+        v = float(raw)
+        if not math.isfinite(v) or abs(v) > hi:
+            raise ValueError('数值超出范围')
+        return v
+
     def _redirect(self, location: str, extra: list | None = None) -> None:
         headers = [('Location', location)] + (extra or [])
         self._send(303, b'', headers=headers)
@@ -654,24 +713,28 @@ class Handler(BaseHTTPRequestHandler):
             for e in entries[:2000]:
                 detail = {k: v for k, v in e.items()
                           if k not in ('at', 'actor', 'action', 'target', 'ip')}
-                w.writerow([time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.get('at', 0))),
-                            e.get('actor', ''), e.get('action', ''), e.get('target', ''),
-                            e.get('ip', ''), json.dumps(detail, ensure_ascii=False)])
+                w.writerow([_csv_cell(c) for c in (
+                    time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.get('at', 0))),
+                    e.get('actor', ''), e.get('action', ''), e.get('target', ''),
+                    e.get('ip', ''), json.dumps(detail, ensure_ascii=False))])
             self._send(200, buf.getvalue().encode('utf-8'),
                        ctype='text/csv; charset=utf-8',
                        headers=[('Content-Disposition', 'attachment; filename=audit.csv'),
                                 ('Cache-Control', 'no-store')])
             return
         html_body = pages.audit_page(entries[:500], q, logout_csrf=tok)
-        headers = self._page_headers(self._slide_session_cookie(user) or setc)
+        headers = self._page_headers(self._slide_session_cookie(user), setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
                    headers=headers)
 
-    def _page_headers(self, setc: str | None) -> list:
-        """Common response headers for the authed HTML faces."""
+    def _page_headers(self, *setcs: str | None) -> list:
+        """Common response headers for the authed HTML faces. Every non-empty
+        Set-Cookie is emitted: a sliding session re-issue must not swallow a
+        freshly minted CSRF cookie (the next form post would then 403)."""
         headers = [('Cache-Control', 'no-store'), *_html_security_headers()]
-        if setc:
-            headers.append(('Set-Cookie', setc))
+        for c in setcs:
+            if c:
+                headers.append(('Set-Cookie', c))
         return headers
 
     def _export_url(self, user: dict, ttl: int = 30 * 86400) -> tuple:
@@ -776,15 +839,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         qs = parse_qs(urlsplit(self.path).query)
         fmt = (qs.get('fmt') or ['clash'])[0].lower()
-        body = self._convert_body(fmt, self._user_yaml_bytes(user))
+        managed = f'{pages.public_host()}{self.path}' if fmt == 'surge' else None
+        body = self._convert_body(fmt, self._user_yaml_bytes(user), managed_url=managed)
         ctype, title_suffix = self._FMT_META.get(fmt, self._FMT_META['clash'])
         safe = re.sub(r'[^A-Za-z0-9_-]', '', str(user.get('username') or 'user')) or 'user'
-        self._send(200, body, ctype=ctype,
-                   headers=[('Content-Disposition',
-                             f'attachment; filename=mango-connect-{safe}{title_suffix}'),
-                            ('Cache-Control', 'private, no-store'),
-                            ('profile-title', f'mango-connect-{safe}{title_suffix}'),
-                            ('profile-update-interval', '6')])
+        headers = [('Content-Disposition',
+                    f'attachment; filename=mango-connect-{safe}{title_suffix}'),
+                   ('Cache-Control', 'private, no-store'),
+                   ('profile-title', f'mango-connect-{safe}{title_suffix}'),
+                   ('profile-update-interval', '6')]
+        # Import links are what client apps poll: they need the quota/expiry
+        # header just like /sub/<token>.
+        userinfo = self._userinfo_header(user)
+        if userinfo:
+            headers.append(('subscription-userinfo', userinfo))
+        self._send(200, body, ctype=ctype, headers=headers)
 
     def _serve_docs(self) -> None:
         user = self._current_user()
@@ -794,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
         tok, setc = self._csrf_pair()
         html_body = pages.docs_page(role=str(user.get('role') or 'user'),
                                     logout_csrf=tok)
-        headers = self._page_headers(self._slide_session_cookie(user) or setc)
+        headers = self._page_headers(self._slide_session_cookie(user), setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
                    headers=headers)
 
@@ -812,7 +881,7 @@ class Handler(BaseHTTPRequestHandler):
                                      logout_csrf=tok,
                                      aligned=meta.get('aligned'),
                                      aligned_at=str(meta.get('generated_at') or ''))
-        headers = self._page_headers(self._slide_session_cookie(user) or setc)
+        headers = self._page_headers(self._slide_session_cookie(user), setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8',
                    headers=headers)
 
@@ -953,7 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         html_body = pages.admin_page(records, tokens_by_id, tok, msg=msg, err=err,
                                      q=q, expiring=expiring, near_quota=near_quota)
-        headers = self._page_headers(self._slide_session_cookie(user) or setc)
+        headers = self._page_headers(self._slide_session_cookie(user), setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8', headers=headers)
 
     # ------------------------------------------------------------ POST: auth
@@ -1154,9 +1223,9 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect('/admin?err=' + quote(email_err))
             return
         try:
-            quota_gb = float(self._field(form, 'quota_gb') or 0)
-            expire_days = int(float(self._field(form, 'expire_days') or 0))
-            reset_day = int(float(self._field(form, 'reset_day') or 1))
+            quota_gb = self._num(self._field(form, 'quota_gb'), 0, 1 << 20)
+            expire_days = int(self._num(self._field(form, 'expire_days'), 0, 36500))
+            reset_day = int(self._num(self._field(form, 'reset_day'), 1, 31))
         except ValueError:
             self._redirect('/admin?err=' + quote('配额/有效期/重置日格式不正确'))
             return
@@ -1175,6 +1244,9 @@ class Handler(BaseHTTPRequestHandler):
                 email=email, notes=notes)
         except ValueError as e:
             self._redirect('/admin?err=' + quote(str(e)))
+            return
+        except users.ScryptBusy:
+            self._redirect('/admin?err=' + quote('系统繁忙，请稍后再试'))
             return
         user_id = rec['id']
         rec, plaintext = token_store.create_token(token_store.token_file(),
@@ -1208,7 +1280,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect('/admin?err=' + quote('用户不存在'))
                 return
             if action == 'set-quota':
-                gb = float(value) if value else 0
+                gb = self._num(value, 0, 1 << 20)
                 if gb < 0:
                     self._redirect('/admin?err=' + quote('配额不能为负数（0 = 不限量）'))
                     return
@@ -1218,7 +1290,7 @@ class Handler(BaseHTTPRequestHandler):
                             target=target['username'], value=gb)
                 self._redirect('/admin?msg=' + quote(f'[{target["username"]}] 配额已更新'))
             elif action == 'set-expire':
-                days = int(float(value)) if value else 0
+                days = int(self._num(value, 0, 36500))
                 if days < 0:
                     self._redirect('/admin?err=' + quote('天数不能为负数（0 = 不限）'))
                     return
@@ -1262,6 +1334,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect('/admin?err=' + quote('未知操作'))
         except (ValueError, KeyError) as e:
             self._redirect('/admin?err=' + quote(str(e)))
+        except users.ScryptBusy:
+            self._redirect('/admin?err=' + quote('系统繁忙，请稍后再试'))
 
     # ---------------------------------------------------------- POST: ingest
 
@@ -1388,30 +1462,44 @@ class Handler(BaseHTTPRequestHandler):
         'uri': ('text/plain; charset=utf-8', '-urilist'),
     }
 
-    def _convert_body(self, fmt: str, body: bytes) -> bytes:
+    def _convert_body(self, fmt: str, body: bytes,
+                      managed_url: str | None = None) -> bytes:
         """Convert the Clash mirror body to the requested client format.
-        Unknown fmt falls back to clash."""
+        Unknown fmt falls back to clash. Results are memoised per (body,
+        fmt, managed_url): every client polls the same mirror, so the YAML
+        parse + conversion runs once per gateway refresh, not per request."""
         fmt = (fmt or 'clash').lower()
-        if fmt == 'clash':
+        if fmt == 'clash' or fmt not in self._FMT_META:
             return body
+        key = (hashlib.sha256(body).digest(), fmt, managed_url)
+        with _CONVERT_LOCK:
+            hit = _CONVERT_CACHE.get(key)
+            if hit is not None:
+                _CONVERT_CACHE.move_to_end(key)
+                return hit
         try:
             # the mirror body is always Clash YAML, whatever the target format
             clash = __import__('yaml').safe_load(body.decode('utf-8'))
-        except Exception:
-            return body  # unparseable mirror: serve as-is
-        if fmt == 'singbox':
-            cfg, _skipped = fmtconv.to_singbox(clash)
-            return json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8')
-        if fmt == 'surge':
-            text, _skipped = fmtconv.to_surge(clash)
-            return text.encode('utf-8')
-        if fmt == 'qx':
-            text, _skipped = fmtconv.to_qx(clash)
-            return text.encode('utf-8')
-        if fmt == 'uri':
-            text, _skipped = fmtconv.to_uri_list(clash)
-            return text.encode('utf-8')
-        return body
+            if not isinstance(clash, dict):
+                raise ValueError('mirror is not a mapping')
+            if fmt == 'singbox':
+                text, skipped = fmtconv.to_singbox_json(clash)
+            elif fmt == 'surge':
+                text, skipped = fmtconv.to_surge(clash, managed_url=managed_url)
+            elif fmt == 'qx':
+                text, skipped = fmtconv.to_qx(clash)
+            else:
+                text, skipped = fmtconv.to_uri_list(clash)
+        except Exception as e:
+            sys.stderr.write(f'mango-share ERROR convert fmt={fmt}: {type(e).__name__}: {e}\n')
+            return body  # unconvertible mirror: serve the Clash body as-is
+        out = text.encode('utf-8')
+        sys.stderr.write(f'mango-share convert fmt={fmt} skipped={len(skipped)}\n')
+        with _CONVERT_LOCK:
+            _CONVERT_CACHE[key] = out
+            while len(_CONVERT_CACHE) > _CONVERT_CACHE_MAX:
+                _CONVERT_CACHE.popitem(last=False)
+        return out
 
     def _serve_sub(self) -> None:
         if not self._authorized():
@@ -1456,17 +1544,25 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(urlsplit(self.path).query)
         fmt = (qs.get('fmt') or ['clash'])[0].lower()
         if fmt != 'clash':
-            body = self._convert_body(fmt, body)
+            # Surge auto-updates from the #!MANAGED-CONFIG line: point it
+            # back at the URL the client actually used.
+            managed = f'{pages.public_host()}{self.path}' if fmt == 'surge' else None
+            body = self._convert_body(fmt, body, managed_url=managed)
         ctype, title_suffix = self._FMT_META.get(fmt, self._FMT_META['clash'])
-        digest = hashlib.sha256(body).hexdigest()
+        userinfo = self._userinfo_header(user)
+        # The validator covers the userinfo header too: a 304 replays the
+        # client's cached headers, so a body-only ETag would freeze the
+        # quota/expiry bar until the node list itself changed.
+        digest = hashlib.sha256(body + b'\0' + (userinfo or '').encode()).hexdigest()
         etag = f'"{digest}"'
+        # last-seen tracks polls, including the conditional ones
+        token_store.touch(self._rec, token_store.token_file())
         inm = (self.headers.get('If-None-Match') or '').strip()
-        if inm and hmac.compare_digest(inm, etag):
+        if inm and hmac.compare_digest(inm.encode(), etag.encode()):
             self._send(304, b'', headers={'ETag': etag,
                                           'Cache-Control': 'private, no-cache',
                                           'profile-title': const.PROFILE_TITLE})
             return
-        token_store.touch(self._rec, token_store.token_file())
         headers = {
             'ETag': etag,
             'Cache-Control': 'private, no-cache',
@@ -1474,7 +1570,6 @@ class Handler(BaseHTTPRequestHandler):
             'profile-update-interval': '6',
             'profile-title': f'{const.PROFILE_TITLE}{title_suffix}',
         }
-        userinfo = self._userinfo_header(user)
         if userinfo:
             headers['subscription-userinfo'] = userinfo
         headers['profile-web-page-url'] = f'{pages.public_host()}/dashboard'
@@ -1496,9 +1591,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             meta = STATE.ensure_fresh()
         except Exception as e:
+            # Same contract as /sub: a failed re-render serves last-good
+            # metadata rather than an error.
             sys.stderr.write(f'mango-share ERROR render failed: {e}\n')
-            self._send(500, b'{"error":"render failed"}')
-            return
+            meta = STATE.last_meta
+            if not meta:
+                try:
+                    meta = json.loads(STATE.paths['meta'].read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    self._send(500, b'{"error":"render failed"}')
+                    return
         user, ok, reason = self._sub_user_gate()
         payload = {
             'profile': const.PROFILE_TITLE,

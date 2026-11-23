@@ -13,6 +13,7 @@ All user data must be escaped before interpolation (_esc / html.escape).
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import time
@@ -825,15 +826,25 @@ def _meter(pct: float) -> str:
     return f'<div class="{cls}" role="presentation"><span style="width:{pct:.1f}%"></span></div>'
 
 
+def _with_fmt(url: str, fmt: str) -> str:
+    return f'{url}{"&" if "?" in url else "?"}fmt={fmt}'
+
+
 def _client_links(url: str) -> List[Tuple[str, str]]:
+    """Deep links per client. Surge and Quantumult X cannot parse Clash YAML,
+    so they get their native format; Shadowrocket's sub:// scheme takes the
+    URL base64-encoded (it imports Clash YAML fine)."""
     enc = quote(url, safe='')
+    surge = quote(_with_fmt(url, 'surge'), safe='')
     qx = 'quantumult-x:///update-remote-profile?remote-resource=' + quote(
-        json.dumps({'server_remote': [f'{url}, tag={VISIBLE_BRAND}']}, separators=(',', ':')))
+        json.dumps({'server_remote': [f'{_with_fmt(url, "qx")}, tag={VISIBLE_BRAND}']},
+                   separators=(',', ':'), ensure_ascii=False), safe='')
+    rocket = base64.urlsafe_b64encode(url.encode('utf-8')).decode('ascii').rstrip('=')
     return [
         ('Clash / Mihomo', f'clash://install-config?url={enc}'),
         ('Stash', f'stash://install-config?url={enc}'),
-        ('Shadowrocket', f'sub://{enc}'),
-        ('Surge', f'surge:///install-config?url={enc}'),
+        ('Shadowrocket', f'sub://{rocket}'),
+        ('Surge', f'surge:///install-config?url={surge}'),
         ('Quantumult X', qx),
     ]
 
@@ -1126,7 +1137,6 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
     </div>
     <div class="page-actions">{admin_link}<a class="btn" href="/nodes">{_icon('activity', 15)}节点现状</a></div>
   </header>"""
-    enc_export = _esc(quote(export_url, safe=''))
     fmt_chips = ''.join(
         f'<a class="chip" href="/sub/download?fmt={f}" download>{_icon("download", 13)}{_esc(n)}</a>'
         for f, n in (('singbox', 'Sing-Box JSON'), ('surge', 'Surge CONF'),
@@ -1167,13 +1177,7 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
       <div class="section">
         <p class="section-title">{_icon('external-link', 14)}一键导入</p>
         <p class="faint">选择你的客户端，点击即自动导入；客户端会以此地址长期自动更新。</p>
-        <div class="client-tiles deep-links">
-          <a class="client-tile" href="clash://install-config?url={enc_export}"><span>Clash / Mihomo</span>{_icon('external-link', 15)}</a>
-          <a class="client-tile" href="stash://install-config?url={enc_export}"><span>Stash</span>{_icon('external-link', 15)}</a>
-          <a class="client-tile" href="sub://{enc_export}"><span>Shadowrocket</span>{_icon('external-link', 15)}</a>
-          <a class="client-tile" href="surge:///install-config?url={enc_export}"><span>Surge</span>{_icon('external-link', 15)}</a>
-          <a class="client-tile" href="quantumult-x:///update-remote-profile?remote-resource={_esc(quote(json.dumps({'server_remote': [export_url + ', tag=' + VISIBLE_BRAND]}, ensure_ascii=False), safe=''))}"><span>Quantumult X</span>{_icon('external-link', 15)}</a>
-        </div>
+        {_client_tiles(export_url)}
       </div>
       <div class="section">
         <p class="section-title">{_icon('code', 14)}其他格式下载</p>
@@ -1465,9 +1469,9 @@ def nodes_page(nodes: List[Dict[str, Any]], error: str, *, active: str = 'nodes'
 _DOC_SECTIONS: Sequence[Tuple[str, str, Sequence[Tuple[str, str]]]] = (
     ('formats', '订阅端点与格式', (
         ('GET /sub/<token>', 'Clash / Mihomo YAML（默认）。全部节点与规则为网关客户端导出的字节级镜像。'),
-        ('GET /sub/<token>?fmt=singbox', 'Sing-Box JSON（完整协议：vless/vmess/anytls/tuic/hysteria2/mieru/http/socks5 全支持）。'),
-        ('GET /sub/<token>?fmt=surge', 'Surge CONF（受支持协议子集：ss/vmess/trojan/http/socks5/tuic；vless/anytls/mieru/hysteria2 无 Surge 对应，自动省略）。'),
-        ('GET /sub/<token>?fmt=qx', 'Quantumult X（server_local 子集 + 规则降级 proxy/direct）。'),
+        ('GET /sub/<token>?fmt=singbox', 'Sing-Box JSON（1.12+ 新版 schema：策略组、中继链 detour、规则集全量转换；vless/vmess/trojan/ss/anytls/tuic/hysteria2/http/socks5，mieru 无对应自动省略）。'),
+        ('GET /sub/<token>?fmt=surge', 'Surge CONF（托管配置，策略组/中继 underlying-proxy/规则全量转换；ss/vmess/trojan/http/socks5/tuic/hysteria2，vless/anytls/mieru 无 Surge 对应自动省略）。'),
+        ('GET /sub/<token>?fmt=qx', 'Quantumult X（server_local + 策略组 + filter_local 规则；ss/vmess/trojan/http/socks5，中继链与 reality 节点省略）。'),
         ('GET /sub/<token>?fmt=uri', 'URI 列表（v2rayN 风格 base64，vless/vmess/trojan/ss/hysteria2/tuic/anytls）。'),
     )),
     ('auth', '导出认证模型', (

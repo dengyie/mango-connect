@@ -10,4 +10,7 @@ CLASH_DIR=${SHARE_CLASH_DIR:-$(dirname "$STATE")/clash}
 TOKEN_FILE=${SHARE_GATEWAY_EXPORT_TOKEN:-$CLASH_DIR/subscriptions/client-export.token}
 GATEWAY=${SHARE_GATEWAY_BASE:-http://127.0.0.1:2053}
 TOKEN=$(cat "$TOKEN_FILE")
-curl -sf --max-time 20 "$GATEWAY/sub/clash?token=$TOKEN" -o /dev/null
+# URL via a stdin config, not argv: the token must not show up in `ps`.
+# -q/--noproxy: root's curlrc on this host may point at a local proxy.
+printf 'url = "%s/sub/clash?token=%s"\n' "$GATEWAY" "$TOKEN" |
+  curl -q --noproxy '*' -sf --max-time 20 -K - -o /dev/null
