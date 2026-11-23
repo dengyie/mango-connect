@@ -1617,7 +1617,8 @@ def _client_app(app: Dict[str, Any]) -> str:
 
 
 _ANDROID_GUIDE = (
-    ('选哪个安装包', '近几年的手机选 <code>arm64-v8a</code>；不确定架构就选「通用包 universal」（体积大一些，任何手机都能装）；'
+    ('选哪个安装包', '近几年的手机选 <code>arm64-v8a</code>；不确定架构就选「通用包 universal」（体积大一些，任何手机都能装；'
+                 'FlClash 不提供通用包，直接选 arm64-v8a）；'
                  'armeabi-v7a 只给老旧 32 位机型，x86_64 只给模拟器 / Chromebook。'),
     ('允许安装', '下载完成后在通知栏或「文件管理 · 下载」里点开 APK，按提示允许浏览器「安装未知应用」；'
                '小米 / 华为 / OPPO / vivo 的「纯净模式 / 安全守护」拦截时选「继续安装」或临时关闭。'),
@@ -1629,7 +1630,7 @@ _ANDROID_GUIDE = (
 
 
 _ANDROID_TIP = ('<div class="client-app"><p class="muted" style="margin:0">选包：近几年的手机选 <code>arm64-v8a</code>，'
-                '不确定就选「通用包 universal」；安装与防掉线步骤见本节末尾<a href="#android-guide">「Android 安装指引」</a>。</p></div>')
+                '不确定就选「通用包 universal」（FlClash 无通用包，选 arm64-v8a）；安装与防掉线步骤见本节末尾<a href="#android-guide">「Android 安装指引」</a>。</p></div>')
 
 
 def _android_guide() -> str:
