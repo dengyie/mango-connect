@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.tokens/
+*.token
+# runtime state (SHARE_STATE_DIR may be the checkout itself)
+*.json
+!tests/**/*.json
+secret.key
+*.log
+logs/
+backups/
+public/
+rollback/
+.DS_Store

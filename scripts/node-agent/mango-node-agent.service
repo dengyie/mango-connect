@@ -1,0 +1,23 @@
+[Unit]
+Description=mango-connect node agent (sing-box stats -> station ingest)
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Environment=AGENT_NODE_NAME=CHANGE-ME
+Environment=AGENT_NODE_TOKEN=CHANGE-ME
+Environment=AGENT_API_BASE=https://share.example.com
+Environment=AGENT_SING_API=127.0.0.1:10085
+Environment=AGENT_INTERVAL=60
+ExecStart=/usr/bin/python3 /usr/local/bin/mango-node-agent.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
