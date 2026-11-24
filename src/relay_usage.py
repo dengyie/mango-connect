@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict
 
 
 def read_secret(path: Path) -> str:
