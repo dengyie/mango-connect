@@ -162,6 +162,32 @@ def load(path: Path) -> List[Dict[str, Any]]:
     return data
 
 
+# Read cache for page-request hot paths (session lookup, service gate):
+# identity = (path, mtime_ns, size). The store only ever changes via
+# save()/update_user() under the flock (same pattern as the secret cache
+# below), so a stable (mtime_ns, size) means the cached parse is current.
+# Mutators that read-then-write under the lock keep calling plain load()
+# inside their critical section; the cache serves the read-only lookups.
+_USERS_CACHE: Dict[str, Any] = {'key': None, 'records': []}
+
+
+def load_cached(path: Path) -> List[Dict[str, Any]]:
+    """Read-only fast path: no flock, no re-parse when unchanged. Anything
+    off (stat error, changed file) falls back to the plain load."""
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    recs = _USERS_CACHE.get('records')
+    if _USERS_CACHE.get('key') == key and isinstance(recs, list):
+        return recs
+    recs = load(path)
+    _USERS_CACHE['key'] = key
+    _USERS_CACHE['records'] = recs
+    return recs
+
+
 def save(path: Path, records: List[Dict[str, Any]]) -> None:
     snapshot(path)  # rotate a backup of the current store before replacing it
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +208,9 @@ def save(path: Path, records: List[Dict[str, Any]]) -> None:
         except (PermissionError, OSError):
             pass
         os.replace(tmp, path)
+        # Invalidate the read cache; next load_cached() re-reads.
+        _USERS_CACHE['key'] = None
+        _USERS_CACHE['records'] = []
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

@@ -96,6 +96,34 @@ def load(path: Path) -> List[Dict[str, Any]]:
     return data
 
 
+# Read cache for the hot path (server verify): identity = (path, mtime_ns,
+# size). The store only ever changes via save() under the flock, so a stable
+# (mtime_ns, size) means the bytes we cached are the bytes on disk - same
+# assumption _hash_inputs and the export cache already make for other files.
+# Callers that hold the flock (CLI writers) bypass it via load_unlocked to
+# avoid caching a store they are about to replace.
+_LOAD_CACHE: Dict[str, Any] = {'key': None, 'records': []}
+
+
+def load_cached(path: Path) -> List[Dict[str, Any]]:
+    """verify() fast path: no flock, no read when the store is unchanged.
+    Falls back to the locked load when anything is off (first read, changed
+    file, stat error, unparsable cache)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    recs = _LOAD_CACHE.get('records')
+    if _LOAD_CACHE.get('key') == key and isinstance(recs, list):
+        return recs
+    with _locked(path):
+        recs = load(path)
+    _LOAD_CACHE['key'] = key
+    _LOAD_CACHE['records'] = recs
+    return recs
+
+
 def save(path: Path, records: List[Dict[str, Any]]) -> None:
     snapshot(path)  # rotate a backup of the current store before replacing it
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +144,9 @@ def save(path: Path, records: List[Dict[str, Any]]) -> None:
         except (PermissionError, OSError):
             pass  # non-root caller: file already belongs to them
         os.replace(tmp, path)
+        # Invalidate the server-side read cache; next verify() re-reads.
+        _LOAD_CACHE['key'] = None
+        _LOAD_CACHE['records'] = []
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -129,31 +160,47 @@ def _save_locked(path: Path, records: List[Dict[str, Any]]) -> None:
 def verify(path: Path, token: str) -> Optional[Dict[str, Any]]:
     """Return the matching active record, or None. Empty tokens never match.
     Read-only under shared understanding: verification never rewrites the
-    store, so a concurrent CLI add/revoke cannot be lost by a lookup."""
+    store, so a concurrent CLI add/revoke cannot be lost by a lookup.
+    Reads go through the (mtime, size) cache: the flock is only taken when
+    the store actually changed - the common case is zero locks per request."""
     if not token:
         return None
     digest = _hash(token)
-    with _locked(path):
-        for rec in load(path):
-            if rec.get('revoked'):
-                continue
-            if secrets.compare_digest(str(rec.get('token_sha256') or ''), digest):
-                return rec
+    for rec in load_cached(path):
+        if rec.get('revoked'):
+            continue
+        if secrets.compare_digest(str(rec.get('token_sha256') or ''), digest):
+            return rec
     return None
+
+
+# Client poll cadence is minutes at best; a 60s dedupe window keeps the
+# last-used record accurate to the minute while collapsing bursts of
+# conditional polls (304s included) into one lock+append on NFS.
+_TOUCH_WINDOW = 60
+_TOUCH_LAST: Dict[str, Any] = {'id': None, 'at': 0.0}
 
 
 def touch(rec: Dict[str, Any], path: Path) -> None:
     """Record a use. Appends to usage.log (cheap, no read-modify-write of
     tokens.json); CLI list merges it for the last_used column.
-    No-op when the state dir doesn't exist (local dev / no deployment)."""
+    No-op when the state dir doesn't exist (local dev / no deployment).
+    Debounced per token id: repeated polls inside the window update nothing
+    (in-process memory; a restart just re-records, which is harmless)."""
     if not path.parent.exists():
         return
-    entry = {'id': rec.get('id'), 'name': rec.get('name'), 'at': int(time.time())}
+    rid = str(rec.get('id'))
+    now = time.time()
+    if _TOUCH_LAST['id'] == rid and now - _TOUCH_LAST['at'] < _TOUCH_WINDOW:
+        return
+    entry = {'id': rec.get('id'), 'name': rec.get('name'), 'at': int(now)}
     u = _usage_for(path)
     with _locked(u):
         rotate_log_if_large(u)
         with open(u, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    _TOUCH_LAST['id'] = rid
+    _TOUCH_LAST['at'] = now
 
 
 def last_used_map(path: Path) -> Dict[str, int]:

@@ -135,7 +135,7 @@ class ShareState:
             if memo and memo[0] == sha_in and out_path.exists():
                 return out_path, memo[1]
             other_secrets = []
-            for r in users.load(users.users_file()):
+            for r in users.load_cached(users.users_file()):
                 if str(r.get('id')) == uid:
                     continue
                 for c in (r.get('credentials') or {}).values():
@@ -659,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if not payload:
             return None
-        records = users.load(users.users_file())
+        records = users.load_cached(users.users_file())
         rec = users.find_by_id(records, payload.get('uid'))
         if rec is None:
             return None
@@ -868,7 +868,7 @@ class Handler(BaseHTTPRequestHandler):
             exp_i = int(exp or 0)
         except ValueError:
             exp_i = -1
-        records = users.load(users.users_file())
+        records = users.load_cached(users.users_file())
         user = users.find_by_id(records, uid)
         if user is not None:
             # The account's CURRENT token_id is the revocation gate: a link
@@ -1077,7 +1077,7 @@ class Handler(BaseHTTPRequestHandler):
         msg = (query.get('msg') or [''])[0]
         err = (query.get('err') or [''])[0]
         q = (query.get('q') or [''])[0].strip().lower()
-        records = users.load(users.users_file())
+        records = users.load_cached(users.users_file())
         now = int(time.time())
         expiring = [u for u in records if u.get('status') == 'active'
                     and 0 < int(u.get('expire_ts') or 0) - now <= 7 * 86400]
@@ -1118,7 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(429, body, ctype='text/html; charset=utf-8',
                        headers=[('Cache-Control', 'no-store'), *_html_security_headers()])
             return
-        records = users.load(users.users_file())
+        records = users.load_cached(users.users_file())
         rec = users.find_by_username(records, username)
         if rec is None:
             users.record_login_fail(ip, username)
@@ -1350,7 +1350,7 @@ class Handler(BaseHTTPRequestHandler):
         action = self._field(form, 'action')
         value = self._field(form, 'value').strip()
         try:
-            records = users.load(users.users_file())
+            records = users.load_cached(users.users_file())
             target = users.find_by_id(records, uid)
             if target is None:
                 self._redirect('/admin?err=' + quote('用户不存在'))
@@ -1507,7 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
         rec = getattr(self, '_rec', None)
         if not rec:
             return None, True, ''
-        records = users.load(users.users_file())
+        records = users.load_cached(users.users_file())
         user = users.find_by_token_id(records, rec.get('id'))
         if user is None:
             return None, True, ''
