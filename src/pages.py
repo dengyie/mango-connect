@@ -576,6 +576,25 @@ h3{font-size:13.5px;font-weight:650}
 .meter.is-over>span{background:var(--bad)}
 .meter.is-high>span{background:var(--warn)}
 
+/* ---- usage detail page ---- */
+.usage-chart{display:flex;align-items:flex-end;gap:6px;height:160px;padding-top:8px;min-width:0}
+.usage-chart-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.usage-bar-col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:2px;min-width:0;height:100%;position:relative}
+.usage-bar-up,.usage-bar-down{width:100%;max-width:26px;border-radius:3px 3px 0 0;min-height:0}
+.usage-bar-up{background:var(--accent)}
+.usage-bar-down{background:var(--accent-wash);border:1px solid var(--line-2);border-bottom:0}
+.usage-bar-label{font-size:10px;color:var(--ink-3);white-space:nowrap;overflow:hidden}
+.usage-legend{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px}
+.usage-legend-up{background:var(--accent)}
+.usage-legend-down{background:var(--accent-wash);border:1px solid var(--line-2)}
+.usage-table{width:100%;border-collapse:collapse;font-size:13px}
+.usage-table th{text-align:left;color:var(--ink-3);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line-2)}
+.usage-table td{padding:8px 10px;border-bottom:1px solid var(--line);word-break:break-all}
+.usage-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.usage-table .strong{font-weight:600}
+.usage-chip-active{border-color:var(--accent);color:var(--accent)}
+@media (max-width:640px){.usage-table th:nth-child(2),.usage-table td:nth-child(2){display:none}}
+
 /* ---- buttons & inputs ---- */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:36px;padding:0 14px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);color:var(--ink);font:inherit;font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}
 .btn:hover{background:var(--paper-2);text-decoration:none}
@@ -1151,6 +1170,7 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
     role_pill = f'<span class="pill pill-plain">{"管理员" if is_admin else "成员"}</span>'
     admin_link = (f'<a class="btn" href="/admin">{_icon("users", 15)}管理页</a>'
                   if is_admin else '')
+    usage_link = f'<a class="btn" href="/dashboard/usage">{_icon("activity", 15)}流量明细</a>'
     head = f"""
   <header class="page-head">
     <div class="identity">
@@ -1161,14 +1181,15 @@ def dashboard_page(user: Dict[str, Any], csrf: str, *, status_reason: str = '',
         <div class="meta-line">{role_pill}{state_pill}</div>
       </div>
     </div>
-    <div class="page-actions">{admin_link}<a class="btn" href="/nodes">{_icon('activity', 15)}节点现状</a></div>
+    <div class="page-actions">{admin_link}{usage_link}<a class="btn" href="/nodes">{_icon('globe', 15)}节点现状</a></div>
   </header>"""
     fmt_chips = ''.join(
         f'<a class="chip" href="/sub/download?fmt={f}" download>{_icon("download", 13)}{_esc(n)}</a>'
         for f, n in (('singbox', 'Sing-Box JSON'), ('surge', 'Surge CONF'),
                      ('qx', 'Quantumult X'), ('uri', 'URI 列表')))
     stats = ''.join([
-        _stat('本期用量', usage_value, icon='activity', note=usage_note, extra=usage_meter),
+        _stat('本期用量', usage_value, icon='activity',
+              note=usage_note + ' · <a href="/dashboard/usage">查看明细</a>', extra=usage_meter),
         _stat('到期时间', _esc(expire), icon='calendar', note=_esc(expire_note)),
         _stat('下次重置', _esc(next_reset), icon='refresh',
               note=f'周期起点 {_esc(cycle)} · 每月 {_esc(user.get("reset_day", 1))} 日'),
@@ -1841,3 +1862,125 @@ def admin_page(users: Iterable[Dict[str, Any]], tokens_by_id: Dict[str, Dict[str
   </section>"""
     return _shell(f'{VISIBLE_BRAND} · 管理', body,
                   app=True, active='admin', role='admin', logout_csrf=csrf)
+
+
+def usage_page(user: Dict[str, Any], csrf: str, target_name: str,
+               detail: Dict[str, Any], *, status_reason: str = '',
+               is_admin: bool = False, days: int = 14,
+               msg: str = '', err: str = '', actor_role: str = '') -> str:
+    """Self-service traffic breakdown: daily bar chart + per-node table.
+    Reads only byte counts from traffic-ingest.log via usage_stats; no
+    credential material ever reaches this page.
+
+    `user` is the record whose quota stats are shown (the admin-inspected
+    target or the member themself); `actor_role` overrides the shell/nav
+    role so an admin inspecting a member keeps the admin navigation - the
+    viewer's chrome must follow the viewer, never the inspected account."""
+    quota = int((user or {}).get('quota_bytes') or 0)
+    used = int((user or {}).get('used_bytes') or 0)
+    if quota > 0:
+        pct = min(100.0, used / quota * 100)
+        usage_value = f'{_esc(fmt_bytes(used))}<small>/ {_esc(fmt_bytes(quota))}</small>'
+        usage_note = f'本期剩余 {_esc(fmt_bytes(max(0, quota - used)))} · 已用 {pct:.0f}%'
+        usage_meter = _meter(pct)
+    else:
+        usage_value = f'{_esc(fmt_bytes(used))}<small>不限量</small>'
+        usage_note = '本期累计用量'
+        usage_meter = ''
+    total = (detail or {}).get('total') or {}
+    daily = (detail or {}).get('daily') or []
+    by_node = (detail or {}).get('by_node') or []
+    peak = max((int(d.get('up', 0)) + int(d.get('down', 0)) for d in daily), default=0) or 1
+
+    # Daily bar chart: pure inline flex divs, no external JS/chart lib.
+    # Accessibility: the chart is aria-hidden decoration; the same numbers
+    # live in a visually-hidden data table (and the real node table below),
+    # so screen-reader and keyboard users get the data without 90 tab stops.
+    # Hover title is a progressive extra, never the only way to see values.
+    bars = ''.join(
+        f'<div class="usage-bar-col" title="{_esc(d.get("date", ""))} · '
+        f'↑{_esc(fmt_bytes(int(d.get("up", 0))))} / ↓{_esc(fmt_bytes(int(d.get("down", 0))))}">'
+        f'<div class="usage-bar-up" style="height:{(int(d.get("up", 0)) / peak) * 100:.1f}%"></div>'
+        f'<div class="usage-bar-down" style="height:{(int(d.get("down", 0)) / peak) * 100:.1f}%"></div>'
+        f'<span class="usage-bar-label">{_esc(d.get("date", "")[5:])}</span></div>'
+        for d in daily)
+    chart_rows = ''.join(
+        f'<tr><th scope="row">{_esc(d.get("date", ""))}</th>'
+        f'<td>{_esc(fmt_bytes(int(d.get("up", 0))))}</td>'
+        f'<td>{_esc(fmt_bytes(int(d.get("down", 0))))}</td></tr>'
+        for d in daily)
+
+    node_rows = ''.join(
+        f'<tr><td class="usage-node">{_esc(r.get("node", ""))}</td>'
+        f'<td class="num">{_esc(fmt_bytes(int(r.get("up", 0))))}</td>'
+        f'<td class="num">{_esc(fmt_bytes(int(r.get("down", 0))))}</td>'
+        f'<td class="num strong">{_esc(fmt_bytes(int(r.get("up", 0)) + int(r.get("down", 0))))}</td></tr>'
+        for r in by_node) or '<tr><td colspan="4" class="faint">近 ' + str(days) + ' 天暂无经过计量节点的流量记录</td></tr>'
+
+    admin_switch = ''
+    if is_admin:
+        admin_switch = f"""
+      <form method="get" action="/dashboard/usage" class="form-actions" style="margin:0">
+        <label class="label" for="u">查看用户</label>
+        <input type="text" id="u" name="u" value="{_esc(target_name)}" spellcheck="false" style="max-width:12rem">
+        <input type="hidden" name="days" value="{int(days)}">
+        <button type="submit" class="btn">切换</button>
+      </form>"""
+    day_links = ' '.join(
+        f'<a class="chip{" usage-chip-active" if d == days else ""}" '
+        f'href="/dashboard/usage?days={d}{"&u=" + quote(target_name) if is_admin and target_name else ""}"'
+        + (' aria-current="true"' if d == days else '')
+        + f'>{d} 天</a>'
+        for d in (7, 14, 30, 90))
+
+    head = f"""
+  <header class="page-head">
+    <div class="identity">
+      <div class="avatar" aria-hidden="true">{_esc(target_name[:1] or '?')}</div>
+      <div>
+        <p class="eyebrow">流量明细</p>
+        <h1>{_esc(target_name)}</h1>
+        <div class="meta-line">{admin_switch}</div>
+      </div>
+    </div>
+    <div class="page-actions"><a class="btn" href="/dashboard">{_icon('user', 15)}用户中心</a></div>
+  </header>"""
+    body = f"""
+  {head}
+  {_flash(msg, err)}
+  <div class="stats">
+    {_stat('本期用量', usage_value, icon='activity', note=usage_note, extra=usage_meter)}
+    {_stat('近 ' + str(days) + ' 天合计', f'{_esc(fmt_bytes(int(total.get("up", 0)) + int(total.get("down", 0))))}',
+           icon='trending-up',
+           note=f'↑{_esc(fmt_bytes(int(total.get("up", 0))))} · ↓{_esc(fmt_bytes(int(total.get("down", 0))))}')}
+  </div>
+  <section class="panel">
+    <div class="panel-head"><h2>{_icon('activity', 16)}每日趋势</h2>
+      <span class="chip-row" style="margin:0">{day_links}</span></div>
+    <div class="panel-body">
+      <div class="usage-chart-scroll"><div class="usage-chart" aria-hidden="true">{bars}</div></div>
+      <table class="visually-hidden">
+        <caption>近 {int(days)} 天每日流量</caption>
+        <thead><tr><th scope="col">日期</th><th scope="col">上行</th><th scope="col">下行</th></tr></thead>
+        <tbody>{chart_rows}</tbody>
+      </table>
+      <p class="faint" style="margin-top:10px"><span class="usage-legend usage-legend-up"></span>上行
+         <span class="usage-legend usage-legend-down" style="margin-left:12px"></span>下行
+         · 每日数值见下方表格与节点明细，手机上可左右滑动图表</p>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>{_icon('globe', 16)}按节点明细</h2>
+      <span class="faint">近 {int(days)} 天 · 按用量排序</span></div>
+    <div class="panel-body">
+      <table class="usage-table">
+        <thead><tr><th>节点</th><th class="num">上行</th><th class="num">下行</th><th class="num">合计</th></tr></thead>
+        <tbody>{node_rows}</tbody>
+      </table>
+      <p class="faint" style="margin-top:10px">用量由计量节点侧上报：自建节点经 node-agent，外部节点经 tebi 中转入口（启用后）。用量由自建节点侧上报累计；未经过计量入口的直连流量不在此列。</p>
+    </div>
+  </section>"""
+    return _shell(f'{VISIBLE_BRAND} · 流量明细', body,
+                  app=True, active='dashboard',
+                  role=actor_role or str((user or {}).get('role') or 'user'),
+                  logout_csrf=csrf)

@@ -3207,3 +3207,277 @@ class ClientsHttpTests(AccountHarness):
         status, headers, body = self._req('/favicon.ico')
         self.assertEqual(status, 200)
         self.assertTrue(body.startswith(b'\x89PNG'), body[:8])
+
+
+class RelayUsageTests(unittest.TestCase):
+    """tebi relay meter: per-connection high-water deltas, user filtering,
+    no negative counters, bounded state. No live controller needed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_apply_deltas_first_tick_baseline_only(self):
+        import relay_usage
+        now = int(time.time())
+        conns = [{
+            'id': 'c1', 'upload': 100, 'download': 200,
+            'metadata': {'inboundName': 'MANGO-RELAY', 'inboundUser': 'alice'},
+        }]
+        updates, state = relay_usage.apply_deltas({}, conns, 'MANGO-RELAY', 60)
+        self.assertEqual(updates, {})  # no baseline yet -> nothing reported
+        self.assertEqual(state['c1'], (100, 200, now))
+
+    def test_apply_deltas_counts_increments_and_filters(self):
+        import relay_usage
+        now = int(time.time())
+        # c2 needs a baseline too: a first-seen connection is baseline-only
+        # (same semantics as test_apply_deltas_first_tick_baseline_only).
+        prev = {'c1': (100, 200, now), 'c2': (0, 0, now)}
+        conns = [
+            {'id': 'c1', 'upload': 150, 'download': 260,
+             'metadata': {'inboundName': 'MANGO-RELAY', 'inboundUser': 'Alice'}},
+            {'id': 'c2', 'upload': 10, 'download': 10,
+             'metadata': {'inboundName': 'MANGO-RELAY', 'inboundUser': 'bob'}},
+            {'id': 'c3', 'upload': 50, 'download': 50,
+             'metadata': {'inboundName': 'DEFAULT-MIXED', 'inboundUser': 'alice'}},
+            {'id': 'c4', 'upload': 99, 'download': 99,
+             'metadata': {'inboundName': 'MANGO-RELAY', 'inboundUser': ''}},
+        ]
+        updates, state = relay_usage.apply_deltas(prev, conns, 'MANGO-RELAY', 60)
+        self.assertEqual(updates['alice'], {'up': 50, 'down': 60})
+        self.assertEqual(updates['bob'], {'up': 10, 'down': 10})
+        self.assertNotIn('c3', state)  # wrong inbound ignored
+        self.assertNotIn('c4', state)  # unauthenticated ignored
+
+    def test_apply_deltas_never_negative_on_reset(self):
+        import relay_usage
+        prev = {'c1': (500, 500, int(time.time()))}
+        conns = [{'id': 'c1', 'upload': 5, 'download': 5,
+                  'metadata': {'inboundName': 'MANGO-RELAY', 'inboundUser': 'alice'}}]
+        updates, state = relay_usage.apply_deltas(prev, conns, 'MANGO-RELAY', 60)
+        self.assertEqual(updates, {})  # counter went backwards -> no report
+        self.assertEqual(state['c1'][:2], (5, 5))  # rebaseline
+
+    def test_state_roundtrip_and_stale_prune(self):
+        import relay_usage
+        path = self.root / 'state.json'
+        fresh = {'c1': (10, 20, int(time.time())),
+                 'old': (1, 2, int(time.time()) - 3600)}
+        relay_usage.save_state(path, fresh)
+        loaded = relay_usage.load_state(path)
+        self.assertEqual(loaded['c1'][:2], (10, 20))
+        _, kept = relay_usage.apply_deltas(loaded, [], 'MANGO-RELAY', 60)
+        self.assertIn('c1', kept)
+        self.assertNotIn('old', kept)  # stale ids dropped, bounds memory
+
+    def test_post_ingest_payload_shape(self):
+        import relay_usage
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return b'{"ok":true,"accepted":1}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout):
+            captured['body'] = req.data
+            captured['auth'] = req.headers.get('Authorization')
+            return FakeResp()
+
+        old = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            res = relay_usage.post_ingest('http://example/ingest/traffic',
+                                          'tebi-relay', 'node-token-xyz',
+                                          {'alice': {'up': 1, 'down': 2}})
+            self.assertTrue(res['ok'])
+            body = json.loads(captured['body'])
+            self.assertEqual(body['node'], 'tebi-relay')
+            self.assertEqual(body['updates'],
+                             [{'user': 'alice', 'up': 1, 'down': 2}])
+            self.assertEqual(captured['auth'], 'Bearer node-token-xyz')
+        finally:
+            urllib.request.urlopen = old
+
+    def test_config_from_env_requires_secret_and_token_paths(self):
+        import relay_usage
+        old = {k: os.environ.get(k) for k in (
+            'RELAY_CONTROLLER_SECRET', 'RELAY_NODE_TOKEN_FILE')}
+        try:
+            os.environ['RELAY_CONTROLLER_SECRET'] = '/a'
+            os.environ['RELAY_NODE_TOKEN_FILE'] = '/b'
+            cfg = relay_usage.config_from_env()
+            self.assertEqual(cfg['inbound_name'], 'MANGO-RELAY')
+            self.assertEqual(cfg['node'], 'tebi-relay')
+            self.assertEqual(cfg['stale_after'], 60)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class SubscriberRelayRenderTests(unittest.TestCase):
+    """Dual-config tier: flag on + per-user render chains every external
+    node through the synthetic mango-relay socks5 entry (per-user cred),
+    drops mesh-only self-built entries, and leaves the owner's plain render
+    (byte-mirror / no user_credentials) untouched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._old_env = {k: os.environ.get(k) for k in
+                         ('SHARE_SUBSCRIBER_RELAY', 'SHARE_RELAY_HOST',
+                          'SHARE_SCOPE')}
+        os.environ['SHARE_SUBSCRIBER_RELAY'] = '1'
+        os.environ['SHARE_RELAY_HOST'] = 'relay.test.example'
+        os.environ['SHARE_SCOPE'] = 'full'
+        import importlib
+        import render_public as _rp
+        importlib.reload(_rp)
+        self.rp = _rp
+        import yaml
+        self.src = self.root / 'mango-clash.yaml'
+        self.doc = {
+            'proxies': [
+                node('[自建] EasyTier-mesh-socks', ntype='http', server='127.0.0.1', port=11080),
+                node('[自建] 🇯🇵VLESS-AWS-Tokyo-Reality', uuid='self-tokyo',
+                     **{'dialer-proxy': '[自建] EasyTier-mesh-socks', 'server': '10.144.144.3'}),
+                node('[自建] 🇺🇸VLESS-AWS-Oregon-Reality', uuid='self-oregon',
+                     **{'dialer-proxy': '[自建] EasyTier-mesh-socks', 'server': '10.144.144.14'}),
+                node('[自建] 🇺🇸PIGEONW-家宽-01', ntype='http',
+                     **{'dialer-proxy': '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'}),
+                node('[自建] 🇺🇸AnyTLS-googlevps', ntype='anytls', server='vps.example.com',
+                     password='shared-anytls', **{'client-fingerprint': 'chrome', 'udp': True}),
+                node('[tomorin] [anytls]JP Osaka Oracle', ntype='anytls',
+                     password='airport-a', **{'udp': True, 'sni': 'jp.airport'}),
+                node('[share] US-Vmess1', ntype='vmess', uuid='airport-b',
+                     alterId=0, cipher='auto'),
+                node('新加坡_BGP_B', ntype='hysteria2', password='airport-c'),
+            ],
+            'proxy-groups': [
+                {'name': 'PROXY', 'type': 'select', 'proxies': ['AUTO']},
+                {'name': 'AUTO', 'type': 'url-test',
+                 'proxies': ['[tomorin] [anytls]JP Osaka Oracle', '[share] US-Vmess1',
+                             '新加坡_BGP_B', '[自建] 🇺🇸AnyTLS-googlevps'],
+                 'url': 'http://www.gstatic.com/generate_204', 'interval': 300},
+                {'name': 'mesh-relay-pool', 'type': 'fallback',
+                 'proxies': ['[自建] 🇯🇵VLESS-AWS-Tokyo-Reality', '[自建] EasyTier-mesh-socks'],
+                 'url': 'http://www.gstatic.com/generate_204', 'interval': 60},
+            ],
+            'rules': ['MATCH,PROXY'],
+        }
+        self.src.write_text(yaml.safe_dump(self.doc, allow_unicode=True), encoding='utf-8')
+        self.wl = self.root / 'share-nodes.json'
+        self.wl.write_text('[]', encoding='utf-8')
+        self.ex = self.root / 'exclude.json'
+        self.ex.write_text('[]', encoding='utf-8')
+        self.out = self.root / 'public/users/u1.yaml'
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        import importlib
+        importlib.reload(self.rp)
+        self.tmp.cleanup()
+
+    def _render(self, credentials):
+        user = {'id': 'u1', 'username': 'alice', 'credentials': credentials}
+        meta = self.rp.render_user(self.src, self.wl, self.ex, self.out, None,
+                                   user=user, cred_map=[], other_secrets=[],
+                                   pool_dead_path=None)
+        import yaml
+        return meta, yaml.safe_load(self.out.read_text(encoding='utf-8'))
+
+    def test_provisioned_user_gets_relay_tier(self):
+        meta, doc = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        by_name = {p['name']: p for p in doc['proxies']}
+        # synthetic relay node present with the user's own credential
+        relay = by_name.get('mango-relay')
+        self.assertIsNotNone(relay)
+        self.assertEqual(relay['type'], 'socks5')
+        self.assertEqual(relay['server'], 'relay.test.example')
+        self.assertEqual(relay['username'], 'alice')
+        self.assertEqual(relay['password'], 'RELAY-UUID-ALICE')
+        self.assertNotIn('dialer-proxy', relay)  # never self-dial
+        # every external node chains through it
+        for name in ('[tomorin] [anytls]JP Osaka Oracle', '[share] US-Vmess1', '新加坡_BGP_B'):
+            self.assertEqual(by_name[name]['dialer-proxy'], 'mango-relay', name)
+        # self-built public node stays direct; mesh-only entries are dropped
+        self.assertNotIn('dialer-proxy', by_name['[自建] 🇺🇸AnyTLS-googlevps'])
+        for gone in ('[自建] EasyTier-mesh-socks', '[自建] 🇯🇵VLESS-AWS-Tokyo-Reality',
+                     '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'):
+            self.assertNotIn(gone, by_name, gone)
+        # PIGEONW dials through mesh-only Oregon -> also dropped
+        self.assertNotIn('[自建] 🇺🇸PIGEONW-家宽-01', by_name)
+        # groups pruned: no DIRECT-only protocol fallback, relay reachable
+        names = {g['name']: g['proxies'] for g in doc['proxy-groups']}
+        self.assertNotIn('mesh-relay-pool', names)
+        self.assertIn('mango-relay', names['PROXY'])
+        self.assertEqual(meta['relay_added'], True)
+        self.assertEqual(meta['relay_dropped'], 4)
+
+    def test_unprovisioned_user_stays_direct(self):
+        meta, doc = self._render({})
+        by_name = {p['name']: p for p in doc['proxies']}
+        self.assertNotIn('mango-relay', by_name)
+        for name in ('[tomorin] [anytls]JP Osaka Oracle', '新加坡_BGP_B'):
+            self.assertNotIn('dialer-proxy', by_name[name], name)
+        self.assertEqual(meta['relay_added'], False)
+
+    def test_flag_off_keeps_byte_mirror(self):
+        os.environ.pop('SHARE_SUBSCRIBER_RELAY', None)
+        import importlib
+        importlib.reload(self.rp)
+        user = {'id': 'u1', 'username': 'alice',
+                'credentials': {'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}}}
+        meta = self.rp.render_user(self.src, self.wl, self.ex, self.out, None,
+                                   user=user, cred_map=[], other_secrets=[],
+                                   pool_dead_path=None)
+        import yaml
+        doc = yaml.safe_load(self.out.read_text(encoding='utf-8'))
+        self.assertEqual(meta['relay_added'], False)
+        self.assertEqual(meta['relay_dropped'], 0)
+        # owner mirror intact: mesh-only nodes still present verbatim
+        names = [p['name'] for p in doc['proxies']]
+        self.assertIn('[自建] EasyTier-mesh-socks', names)
+        self.assertNotIn('mango-relay', names)
+
+    def test_relay_password_never_leaks_to_other_users(self):
+        # alice's render carries only alice's relay cred; bob's only bob's
+        meta, doc = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        self.assertNotIn('RELAY-UUID-BOB', self.out.read_text(encoding='utf-8'))
+        # the leak gate fires when another user's secret would land in the
+        # output: cred_map maps it onto a node so render substitutes it,
+        # and the gate must catch it before publish
+        user = {'id': 'u1', 'username': 'alice',
+                'credentials': {'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'},
+                                'leak-key': {'uuid': 'OTHER-USER-UUID-9999'}}}
+        cred_map = [{'node': '[tomorin] [anytls]JP Osaka Oracle',
+                     'key': 'leak-key', 'type': 'anytls'}]
+        with self.assertRaises(ValueError):
+            self.rp.render_user(self.src, self.wl, self.ex, self.out, None,
+                                user=user, cred_map=cred_map,
+                                other_secrets=['OTHER-USER-UUID-9999'],
+                                pool_dead_path=None)
+
+    def test_unreachable_chain_detection(self):
+        got = self.rp._unreachable_for_subscribers(self.doc['proxies'])
+        self.assertIn('[自建] EasyTier-mesh-socks', got)      # loopback server
+        self.assertIn('[自建] 🇯🇵VLESS-AWS-Tokyo-Reality', got)  # dials loopback
+        self.assertIn('[自建] 🇺🇸VLESS-AWS-Oregon-Reality', got)  # mesh IP server
+        self.assertIn('[自建] 🇺🇸PIGEONW-家宽-01', got)      # dials mesh IP
+        self.assertNotIn('[自建] 🇺🇸AnyTLS-googlevps', got)  # public, stays

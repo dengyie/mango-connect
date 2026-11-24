@@ -52,6 +52,13 @@ PUBLIC_RULES: List[str] = [
 
 FAKE_NODE_RE = re.compile(DEFAULT_EXCLUDE_FILTER, re.IGNORECASE)
 
+# Subscriber relay tier switch (dual-config architecture, 2026-11-24):
+# per-user renders chain every third-party node through the tebi relay
+# (group mango-relay -> MANGO-RELAY listener) for per-user traffic
+# accounting and airport IP protection. Owner's plain render (the
+# byte-mirror) is never touched. Off = exactly the pre-relay behavior.
+SUBSCRIBER_RELAY = os.environ.get('SHARE_SUBSCRIBER_RELAY', '') == '1'
+
 
 def share_scope(env: Optional[Dict[str, str]] = None) -> str:
     """Sharing scope: 'whitelist' (legacy: share-nodes.json only) or 'full'
@@ -225,6 +232,104 @@ def sanitize_node(p: Dict[str, Any]) -> Dict[str, Any]:
     return q
 
 
+# ------------------------------------------------- subscriber relay tier
+# Dual-config architecture (owner decision 2026-11-24): the owner's own
+# client config stays the untouched byte-mirror; subscribers get every
+# third-party/airport node chained through the tebi per-user relay so that
+# (1) traffic is attributable per user (mihomo inboundUser) and (2) airports
+# never see subscriber IPs. Self-built nodes stay direct - they already have
+# per-user credentials and node-agent metering.
+#
+# The relay is a synthetic socks5 node appended to the subscriber's render,
+# dialing the MANGO-RELAY listener on the tebi gateway (mixed listener with
+# a users map; username = site username so /connections reports
+# metadata.inboundUser, password = the per-user MANGO-RELAY uuid from
+# users.json). From there the gateway's own rule engine picks the egress,
+# so the airport only ever sees tebi. Users without a MANGO-RELAY credential
+# keep today's direct-external render (additive rollout).
+SUBSCRIBER_RELAY_GROUP = 'mango-relay'
+SUBSCRIBER_RELAY_CRED_KEY = 'MANGO-RELAY'  # key in users.json credentials{}
+# Self-built nodes whose servers are only reachable inside the mesh (RFC1918
+# or loopback) or whose dialer chains start there: remote clients cannot
+# dial them directly, so subscriber renders drop them instead of shipping
+# broken entries. plan_drop() already keeps any node a kept node dials
+# through, which here would re-add exactly these unreachable entries.
+_PRIVATE_SERVER_RE = re.compile(
+    r'^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|::1$|localhost$)')
+
+
+def _unreachable_for_subscribers(proxies: List[Dict[str, Any]]) -> set:
+    """Names a remote subscriber's client cannot reach: self-built nodes
+    with a private/loopback server, plus self-built nodes whose dialer chain
+    bottoms out in one (the dialer itself is unresolvable off-mesh)."""
+    by_name = {str(p.get('name')): p for p in proxies if isinstance(p, dict)}
+    bad: set = set()
+    for name, p in by_name.items():
+        if not name.startswith('[自建]'):
+            continue
+        if _PRIVATE_SERVER_RE.match(str(p.get('server') or '')):
+            bad.add(name)
+            continue
+        seen: set = set()
+        cur = p
+        while cur is not None:
+            d = str(cur.get('dialer-proxy') or '')
+            if not d or d in seen:
+                break
+            seen.add(d)
+            nxt = by_name.get(d)
+            if nxt is None:
+                break
+            if _PRIVATE_SERVER_RE.match(str(nxt.get('server') or '')):
+                bad.add(name)
+                break
+            cur = nxt
+    return bad
+
+
+def apply_subscriber_relay(picked: List[Dict[str, Any]], *, relay: bool = True) -> int:
+    """Rewrite picked nodes in place for the subscriber tier. External
+    (non-self-built) nodes get dialer-proxy: mango-relay (the per-user
+    authenticated tebi listener) *only when the relay node is present*;
+    self-built nodes keep working direct chains but entries unreachable
+    off-mesh are removed. Returns the number of dropped nodes."""
+    dropped = 0
+    keep: List[Dict[str, Any]] = []
+    for p in picked:
+        name = str(p.get('name') or '')
+        if name == SUBSCRIBER_RELAY_GROUP:
+            keep.append(p)  # synthetic relay node: already clean, never self-dial
+            continue
+        elif name.startswith('[自建]'):
+            if name in _unreachable_for_subscribers(picked):
+                dropped += 1
+                continue  # mesh-only entry: broken for a remote client
+            p.pop('dialer-proxy', None)  # drop LOCAL-ONLY chains (127.0.0.1 mesh-socks)
+        else:
+            if relay:  # no relay node shipped -> externals stay direct
+                p['dialer-proxy'] = SUBSCRIBER_RELAY_GROUP
+        keep.append(p)
+    picked[:] = keep
+    return dropped
+
+
+def relay_node_for(username: str, uuid: str) -> Dict[str, Any]:
+    """The synthetic first-hop node subscribers dial through. Kept plain
+    (no NODE_PREFIX): re-import loop protection is the subscription-manager
+    source-name prefix, same as every other node in this output."""
+    host = os.environ.get('SHARE_RELAY_HOST', '')
+    port = int(os.environ.get('SHARE_RELAY_PORT', '20540'))
+    return {
+        'name': SUBSCRIBER_RELAY_GROUP,
+        'type': 'socks5',
+        'server': host,
+        'port': port,
+        'username': username,
+        'password': uuid,
+        'udp': True,
+    }
+
+
 def select_nodes(
     proxies: List[Dict[str, Any]],
     whitelist: List[str],
@@ -277,6 +382,7 @@ def render_user(source_path: Path, share_nodes_path: Path, exclude_path: Path,
                    cred_map=cred_map,
                    other_secrets=other_secrets,
                    pool_dead_path=pool_dead_path,
+                   user_name=str(user.get('username') or ''),
                    scope=share_scope())
 
 
@@ -394,6 +500,7 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
             cred_map: Optional[List[Dict[str, Any]]] = None,
             other_secrets: Optional[List[str]] = None,
             pool_dead_path: Optional[Path] = None,
+            user_name: str = '',
             scope: str = 'whitelist') -> Dict[str, Any]:
     exclude = load_json_list(exclude_path)
     pool_dead = load_json_list(pool_dead_path) if pool_dead_path else []
@@ -427,9 +534,42 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
     if user_credentials is not None:
         _substitute_credentials(picked, user_credentials, cred_map or [])
 
-    if scope == 'full':
-        final_groups, final_rules = public_groups, public_rules
-    else:
+    final_groups = public_groups
+    final_rules = public_rules
+    relay_dropped = 0
+    relay_added = False
+    if SUBSCRIBER_RELAY and user_credentials is not None:
+        # Subscriber tier only (owner's plain render keeps the mirror):
+        # airport nodes chain through the per-user relay for traffic
+        # accounting + IP protection; mesh-only self-built entries a remote
+        # client cannot reach are dropped, and group memberships pruned.
+        # The relay node itself is only shipped when the user has a
+        # MANGO-RELAY credential (additive rollout, gen-node-users MANGO-RELAY).
+        relay_cred = (user_credentials.get(SUBSCRIBER_RELAY_CRED_KEY) or {}).get('uuid')
+        if relay_cred:
+            picked.append(relay_node_for(user_name, str(relay_cred)))
+            relay_added = True
+        relay_dropped = apply_subscriber_relay(picked, relay=relay_added)
+        names = [p['name'] for p in picked]
+        if not names:
+            raise ValueError('render produced zero nodes; refusing to publish an empty subscription')
+        if relay_dropped:
+            final_groups = prune_groups(public_groups or [], _unreachable_for_subscribers(proxies))
+            # protocol fallback groups whose only members were mesh-only
+            # become ['DIRECT'] and are dead weight in the subscriber tier.
+            final_groups = [g for g in (final_groups or [])
+                            if not (isinstance(g, dict)
+                                    and g.get('type') in ('fallback', 'url-test', 'load-balance')
+                                    and [m for m in (g.get('proxies') or []) if str(m) == 'DIRECT'])]
+        if relay_added:
+            # every select/url-test/fallback group that routes external
+            # traffic should be able to reach the relay node itself; simplest
+            # correct shape: append it to the group the rules MATCH into
+            for g in final_groups or []:
+                if isinstance(g, dict) and isinstance(g.get('proxies'), list):
+                    g['proxies'].append(SUBSCRIBER_RELAY_GROUP)
+
+    if scope != 'full':
         auto = dict(PUBLIC_GROUPS[1])
         auto['proxies'] = names
         proxy_grp = dict(PUBLIC_GROUPS[0])
@@ -491,6 +631,8 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         'source_sha256': hashlib.sha256(source_path.read_bytes()).hexdigest(),
         'source_node_count': len(proxies),
         'whitelist_count': len(whitelist),
+        'relay_dropped': relay_dropped if (SUBSCRIBER_RELAY and user_credentials is not None) else 0,
+        'relay_added': relay_added,
         'generated_at': __json_ts__(),
     }
     if meta_path is not None:

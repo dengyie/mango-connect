@@ -37,6 +37,7 @@ import render_public
 import share_constants as const
 from share_constants import clash_dir
 import tokens as token_store
+import usage_stats
 import users
 
 
@@ -520,6 +521,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_login()
             elif path == '/dashboard':
                 self._serve_dashboard()
+            elif path == '/dashboard/usage':
+                self._serve_dashboard_usage()
+            elif path == '/api/usage':
+                self._serve_api_usage()
             elif path == '/admin':
                 self._serve_admin()
             elif path == '/nodes':
@@ -807,14 +812,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _user_yaml_bytes(self, user: dict) -> bytes:
         """The subscriber's rendered YAML (global mirror today; per-user
-        file when SHARE_PER_USER_YAML is on)."""
-        if PER_USER_YAML:
+        file when SHARE_PER_USER_YAML is on, or when the subscriber relay
+        tier is on and the user carries a MANGO-RELAY credential)."""
+        if PER_USER_YAML or render_public.SUBSCRIBER_RELAY:
             try:
                 cred_map = STATE._node_cred_map()
-                provisioned = bool(cred_map) and any(
-                    isinstance(m, dict)
-                    and str(m.get('key')) in (user.get('credentials') or {})
-                    for m in cred_map)
+                provisioned = (
+                    # relay tier: provisioned = has the per-user MANGO-RELAY
+                    # cred (cred_map may be empty; render only injects the
+                    # relay node, self-built credentials stay shared)
+                    (render_public.SUBSCRIBER_RELAY
+                     and bool((user.get('credentials') or {})
+                              .get(render_public.SUBSCRIBER_RELAY_CRED_KEY,
+                                   {}).get('uuid')))
+                    # phase-2 self-built credential substitution
+                    or (bool(cred_map) and any(
+                        isinstance(m, dict)
+                        and str(m.get('key')) in (user.get('credentials') or {})
+                        for m in cred_map)))
                 if provisioned:
                     user_path, _ = STATE.ensure_user_fresh(user)
                     if user_path.exists():
@@ -1063,6 +1078,99 @@ class Handler(BaseHTTPRequestHandler):
             export_url=f'{pages.public_host()}{export_url}', msg=msg, err=err)
         headers = self._page_headers(self._slide_session_cookie(fresh) or setc)
         self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8', headers=headers)
+
+    def _usage_target(self, user: dict, query: dict) -> tuple:
+        """Resolve whose usage a request may see. The actor is always the
+        authenticated session user; a role is a capability of that actor,
+        never an identity switch (an earlier draft put the inspected user's
+        record into _slide_session_cookie, which minted the admin a session
+        cookie for the target account - impersonation).
+
+        Returns (actor, target_name). Admin + ?u=<name> inspects that user;
+        ?u= on a non-admin is ignored, not an error."""
+        target_name = str(user.get('username') or '')
+        if user.get('role') == 'admin':
+            wanted = (query.get('u') or [''])[0].strip()
+            if wanted:
+                records = users.load_cached(users.users_file())
+                found = users.find_by_username(records, wanted)
+                if found is None:
+                    return user, None  # unknown target: caller shows the error
+                target_name = str(found.get('username') or wanted)
+        return user, target_name
+
+    def _serve_dashboard_usage(self) -> None:
+        """Self-service traffic detail: daily trend + per-node breakdown,
+        sourced from traffic-ingest.log + its rotations (mtime-cached, no
+        locks on the hot path). Read-only for members; admin may inspect
+        any user via ?u=."""
+        user = self._current_user()
+        if user is None:
+            self._redirect('/login')
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        actor, target_name = self._usage_target(user, query)
+        if target_name is None:
+            self._redirect('/dashboard/usage?err=' + quote('用户不存在'))
+            return
+        days = usage_stats.clamp_days((query.get('days') or ['14'])[0])
+        try:
+            detail = usage_stats.usage_detail(users.ingest_file(), target_name,
+                                              days=days)
+        except Exception as e:
+            # Never fake zeros on an internal error: say so on the page and
+            # keep the traceback in the server log.
+            sys.stderr.write('mango-share ERROR usage detail for %s: %r\n' % (target_name, e))
+            self._redirect('/dashboard/usage?err=' + quote('用量数据暂时不可读，请稍后再试'))
+            return
+        records = users.load_cached(users.users_file())
+        rec = users.find_by_username(records, target_name) or {}
+        fresh = users.refresh_cycle(users.users_file(), rec) if rec else rec
+        ok, reason = users.check_service(fresh) if fresh else (True, '')
+        tok, setc = self._csrf_pair()
+        html_body = pages.usage_page(fresh, tok, target_name, detail,
+                                     status_reason='' if ok else reason,
+                                     is_admin=actor.get('role') == 'admin',
+                                     days=days,
+                                     msg=(query.get('msg') or [''])[0],
+                                     err=(query.get('err') or [''])[0],
+                                     actor_role=str(actor.get('role') or 'user'))
+        # Sliding cookie is minted from the ACTOR's record; `fresh` may be
+        # the inspected user's and must never seed the admin's session.
+        headers = self._page_headers(self._slide_session_cookie(actor) or setc)
+        self._send(200, html_body.encode('utf-8'), ctype='text/html; charset=utf-8', headers=headers)
+
+    def _serve_api_usage(self) -> None:
+        """GET /api/usage - authenticated JSON mirror of the usage page.
+        Ordinary users get their own breakdown (self-only); admin may pass
+        ?u=<name> for any account, but without it gets their own. The
+        response carries byte counts only: no tokens, uuids or credentials."""
+        user = self._current_user()
+        if user is None:
+            self._send(401, json.dumps({'error': 'login required'}).encode(),
+                       headers=[('Cache-Control', 'no-store')])
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        actor, target_name = self._usage_target(user, query)
+        if target_name is None:
+            self._send(404, json.dumps({'error': 'no such user'}).encode(),
+                       headers=[('Cache-Control', 'no-store')])
+            return
+        days = usage_stats.clamp_days((query.get('days') or ['14'])[0])
+        try:
+            detail = usage_stats.usage_detail(users.ingest_file(), target_name,
+                                              days=days)
+        except Exception as e:
+            sys.stderr.write('mango-share ERROR usage api for %s: %r\n' % (target_name, e))
+            self._send(503, json.dumps({'error': 'usage data unavailable'}).encode(),
+                       headers=[('Cache-Control', 'no-store')])
+            return
+        payload = {'ok': True, 'user': target_name,
+                   'viewer': str(actor.get('username') or ''),
+                   'self': target_name == str(actor.get('username') or ''),
+                   **detail}
+        self._send(200, json.dumps(payload, ensure_ascii=False).encode(),
+                   headers=[('Cache-Control', 'no-store')])
 
     def _serve_admin(self) -> None:
         user = self._current_user()
@@ -1599,16 +1707,22 @@ class Handler(BaseHTTPRequestHandler):
             stale = True
         body_path = STATE.paths['out']
         # Phase-2: serve the user's own rendered YAML when the rollout flag is
-        # on and they are provisioned on at least one mapped node. Any
+        # on and they are provisioned (a mapped node credential, or a
+        # MANGO-RELAY credential under the subscriber relay tier). Any
         # per-user failure falls back to the global last-good render (shared
         # credentials stay valid), so connectivity never depends on it.
-        if PER_USER_YAML and user is not None:
+        if (PER_USER_YAML or render_public.SUBSCRIBER_RELAY) and user is not None:
             try:
                 cred_map = STATE._node_cred_map()
-                provisioned = bool(cred_map) and any(
-                    isinstance(m, dict)
-                    and str(m.get('key')) in (user.get('credentials') or {})
-                    for m in cred_map)
+                provisioned = (
+                    (render_public.SUBSCRIBER_RELAY
+                     and bool((user.get('credentials') or {})
+                              .get(render_public.SUBSCRIBER_RELAY_CRED_KEY,
+                                   {}).get('uuid')))
+                    or (bool(cred_map) and any(
+                        isinstance(m, dict)
+                        and str(m.get('key')) in (user.get('credentials') or {})
+                        for m in cred_map)))
                 if provisioned:
                     user_path, _ = STATE.ensure_user_fresh(user)
                     if user_path.exists():
