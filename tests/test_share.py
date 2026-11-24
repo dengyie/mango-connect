@@ -3198,6 +3198,11 @@ class ClientsHttpTests(AccountHarness):
         self.assertIn('clients_mirror', info)
         self.assertFalse(info['clients_mirror']['enabled'])
 
+    def test_every_response_is_noindex(self):
+        for path in ('/', '/login', '/health', '/sub/x', '/clients'):
+            _, headers, _ = self._req(path)
+            self.assertEqual(headers.get('X-Robots-Tag'), 'noindex, nofollow, noarchive', path)
+
     def test_favicon_serves_brand_mark(self):
         status, headers, body = self._req('/favicon.ico')
         self.assertEqual(status, 200)

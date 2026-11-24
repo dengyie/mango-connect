@@ -487,6 +487,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('X-Content-Type-Options', 'nosniff')
+        # Invite-only site: no page or subscription body belongs in a search
+        # index (the edge-managed robots.txt allows search crawlers).
+        self.send_header('X-Robots-Tag', 'noindex, nofollow, noarchive')
         items = (headers or {}).items() if isinstance(headers, dict) else (headers or [])
         for k, v in items:
             self.send_header(k, v)
