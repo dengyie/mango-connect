@@ -3308,6 +3308,51 @@ class RelayUsageTests(unittest.TestCase):
         finally:
             urllib.request.urlopen = old
 
+    def test_next_interval_bursts_on_activity_then_idles(self):
+        import relay_usage
+        now = 1000.0
+        # no activity -> idle pace
+        self.assertEqual(relay_usage.next_interval(0.0, now),
+                         relay_usage.BASE_INTERVAL)
+        # relay conns seen just now -> burst pace
+        self.assertEqual(relay_usage.next_interval(now - 1.0, now),
+                         relay_usage.BURST_INTERVAL)
+        # still within the hold window -> keep bursting
+        self.assertEqual(
+            relay_usage.next_interval(now - relay_usage.BURST_HOLD_SECONDS + 1,
+                                      now),
+            relay_usage.BURST_INTERVAL)
+        # hold window expired -> back to idle
+        self.assertEqual(
+            relay_usage.next_interval(now - relay_usage.BURST_HOLD_SECONDS - 1,
+                                      now),
+            relay_usage.BASE_INTERVAL)
+
+    def test_run_once_returns_relay_activity_flag(self):
+        import relay_usage
+        state_path = self.root / 'state.json'
+        cfg = {'api': 'http://ctl', 'secret_file': str(self.root / 's'),
+               'token_file': str(self.root / 't'),
+               'ingest_url': 'http://example/ingest', 'node': 'tebi-relay',
+               'inbound_name': 'MANGO-RELAY', 'state_file': str(state_path),
+               'timeout': 1, 'stale_after': 60}
+        (self.root / 's').write_text('sec')
+        (self.root / 't').write_text('tok')
+        conns = [{'id': 'c1', 'upload': 1, 'download': 2,
+                  'metadata': {'inboundName': 'MANGO-RELAY',
+                               'inboundUser': 'alice'}}]
+        old = relay_usage.controller_connections
+        relay_usage.controller_connections = lambda *a, **k: conns
+        relay_usage.post_ingest = lambda *a, **k: {'ok': True}
+        try:
+            self.assertTrue(relay_usage.run_once(cfg))
+            # next tick with no relay conns: stale window keeps state but the
+            # activity flag must go false so the loop idles again
+            relay_usage.controller_connections = lambda *a, **k: []
+            self.assertFalse(relay_usage.run_once(cfg))
+        finally:
+            relay_usage.controller_connections = old
+
     def test_config_from_env_requires_secret_and_token_paths(self):
         import relay_usage
         old = {k: os.environ.get(k) for k in (

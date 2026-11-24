@@ -10,11 +10,17 @@ Accounting semantics (IMPORTANT):
   mihomo's /connections reports only ACTIVE connections, with cumulative
   upload/download per connection id. We keep a per-id high-water mark and
   report the positive delta each tick. A connection that opens AND closes
-  entirely between two ticks is invisible -> its bytes are not counted. With
-  a 10s tick and proxy sessions that normally outlive seconds, the loss is
-  small; this is a quota approximation, not a billing-grade counter. Never
-  report a negative delta (counter reset / id reuse) and drop stale ids to
-  bound state memory.
+  entirely between two ticks is invisible -> its bytes are not counted.
+
+  Short-connection coverage: measured on the tebi gateway, a 0.3s sub-sample
+  pace captures >100% of sub-second fetch bytes (over-count is capped by the
+  per-id high-water mark) while the controller API answers in ~5ms, so
+  bursts are cheap. The loop therefore polls at BASE_INTERVAL while idle and
+  drops to BURST_INTERVAL for BURST_SECONDS after relay activity is seen.
+  What remains missed are connections that open and close entirely inside
+  one burst gap - bounded, never negative, quota-grade not billing-grade.
+  Never report a negative delta (counter reset / id reuse) and drop stale
+  ids to bound state memory.
 
 Security: controller secret and node token are read from files/env, never
 logged. Only usernames and byte counts cross the wire to the site.
@@ -30,6 +36,23 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Dict
+
+# Adaptive sampling: idle polling stays at the base interval; once relay
+# connections are seen the loop bursts at the burst interval (measured
+# controller latency ~5ms, so a 0.3s pace is negligible load) for a hold
+# window after the last sighting, which is what makes sub-second proxy
+# fetches visible to the high-water deltas.
+BASE_INTERVAL = 10.0
+BURST_INTERVAL = 0.3
+BURST_HOLD_SECONDS = 30.0
+
+
+def next_interval(saw_relay_ts: float, now: float) -> float:
+    """Sleep seconds before the next poll. Burst while relay connections
+    were seen within the hold window, otherwise idle-pace."""
+    if saw_relay_ts and now - saw_relay_ts < BURST_HOLD_SECONDS:
+        return BURST_INTERVAL
+    return BASE_INTERVAL
 
 
 def read_secret(path: Path) -> str:
@@ -131,7 +154,9 @@ def save_state(path: Path, state: Dict[str, tuple]) -> None:
     os.replace(tmp, path)
 
 
-def run_once(cfg: dict) -> None:
+def run_once(cfg: dict) -> bool:
+    """One sampling tick. Returns True when relay connections were seen
+    (the caller uses that to keep burst sampling alive)."""
     api = cfg['api']
     secret = read_secret(Path(cfg['secret_file']))
     token = read_secret(Path(cfg['token_file']))
@@ -146,6 +171,14 @@ def run_once(cfg: dict) -> None:
         sys.stderr.write('relay-meter %s report users=%d result=%s\n' % (
             time.strftime('%F %T'), len(updates), json.dumps(result)))
     save_state(path, state)
+    # activity flag: only live connections count. The stale window keeps ids
+    # in state for delta continuity, but an empty live snapshot means the
+    # subscriber's connections are gone and the loop may idle again.
+    saw_relay = any(
+        str((c.get('metadata') or {}).get('inboundName') or '') == cfg['inbound_name']
+        and str((c.get('metadata') or {}).get('inboundUser') or '').strip()
+        for c in conns if isinstance(c, dict))
+    return saw_relay
 
 
 def config_from_env() -> dict:
@@ -166,22 +199,31 @@ def config_from_env() -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--once', action='store_true', help='one sampling tick')
-    ap.add_argument('--interval', type=int, default=10, metavar='SEC',
-                    help='polling interval (default 10s)')
+    ap.add_argument('--interval', type=float, default=BASE_INTERVAL,
+                    metavar='SEC',
+                    help='idle polling interval (default 10s; bursts go '
+                         'faster automatically while relay conns are live)')
     args = ap.parse_args()
     cfg = config_from_env()
     if args.once:
         run_once(cfg)
         return 0
-    sys.stderr.write('relay-meter loop every %ss -> %s inbound=%s\n' % (
-        args.interval, cfg['ingest_url'], cfg['inbound_name']))
+    sys.stderr.write('relay-meter loop idle=%ss burst=%ss(hold %.0fs) -> %s '
+                     'inbound=%s\n' % (
+                         args.interval, BURST_INTERVAL, BURST_HOLD_SECONDS,
+                         cfg['ingest_url'], cfg['inbound_name']))
+    saw_relay_ts = 0.0
     while True:
         started = time.time()
         try:
-            run_once(cfg)
+            if run_once(cfg):
+                saw_relay_ts = started
         except Exception as exc:  # noqa: BLE001 - never let a tick kill the loop
             sys.stderr.write('relay-meter tick error: %r\n' % (exc,))
-        time.sleep(max(1, args.interval - (time.time() - started)))
+        wait = next_interval(saw_relay_ts, time.time())
+        if wait == BASE_INTERVAL:
+            wait = args.interval
+        time.sleep(max(0.05, wait - (time.time() - started)))
 
 
 if __name__ == '__main__':
