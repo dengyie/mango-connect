@@ -157,8 +157,7 @@ def config_from_env() -> dict:
             'RELAY_INGEST_URL', 'http://127.0.0.1:2054/ingest/traffic'),
         'node': os.environ.get('RELAY_NODE_NAME', 'tebi-relay'),
         'inbound_name': os.environ.get('RELAY_INBOUND_NAME', 'MANGO-RELAY'),
-        'state_file': os.environ.get(
-            'RELAY_STATE_FILE', '/personal/sub-share/relay-meter-state.json'),
+        'state_file': os.environ['RELAY_STATE_FILE'],
         'timeout': int(os.environ.get('RELAY_TIMEOUT', '20')),
         'stale_after': int(os.environ.get('RELAY_STALE_AFTER', '60')),
     }

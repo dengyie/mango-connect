@@ -3311,10 +3311,12 @@ class RelayUsageTests(unittest.TestCase):
     def test_config_from_env_requires_secret_and_token_paths(self):
         import relay_usage
         old = {k: os.environ.get(k) for k in (
-            'RELAY_CONTROLLER_SECRET', 'RELAY_NODE_TOKEN_FILE')}
+            'RELAY_CONTROLLER_SECRET', 'RELAY_NODE_TOKEN_FILE',
+            'RELAY_STATE_FILE')}
         try:
             os.environ['RELAY_CONTROLLER_SECRET'] = '/a'
             os.environ['RELAY_NODE_TOKEN_FILE'] = '/b'
+            os.environ['RELAY_STATE_FILE'] = '/tmp/relay-state-test.json'
             cfg = relay_usage.config_from_env()
             self.assertEqual(cfg['inbound_name'], 'MANGO-RELAY')
             self.assertEqual(cfg['node'], 'tebi-relay')
