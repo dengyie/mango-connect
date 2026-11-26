@@ -3460,9 +3460,21 @@ class SubscriberRelayRenderTests(unittest.TestCase):
         self.assertEqual(relay['username'], 'alice')
         self.assertEqual(relay['password'], 'RELAY-UUID-ALICE')
         self.assertNotIn('dialer-proxy', relay)  # never self-dial
-        # every external node chains through it
+        # 2026-11-25: mesh twin + fallback pool group (de-tebi single point)
+        mesh_relay = by_name.get('mango-relay-mesh')
+        self.assertIsNotNone(mesh_relay)
+        self.assertEqual(mesh_relay['server'], '10.144.144.32')
+        self.assertEqual(mesh_relay['port'], 20540)
+        self.assertEqual(mesh_relay['username'], 'alice')
+        self.assertEqual(mesh_relay['password'], 'RELAY-UUID-ALICE')
+        self.assertNotIn('dialer-proxy', mesh_relay)
+        pool = {g['name']: g for g in doc['proxy-groups']}.get('mango-relay-pool')
+        self.assertIsNotNone(pool)
+        self.assertEqual(pool['type'], 'fallback')
+        self.assertEqual(pool['proxies'], ['mango-relay', 'mango-relay-mesh'])
+        # every external node chains through the pool group (not a bare node)
         for name in ('[tomorin] [anytls]JP Osaka Oracle', '[share] US-Vmess1', '新加坡_BGP_B'):
-            self.assertEqual(by_name[name]['dialer-proxy'], 'mango-relay', name)
+            self.assertEqual(by_name[name]['dialer-proxy'], 'mango-relay-pool', name)
         # self-built public node stays direct; mesh-only entries are dropped
         self.assertNotIn('dialer-proxy', by_name['[自建] 🇺🇸AnyTLS-googlevps'])
         for gone in ('[自建] EasyTier-mesh-socks', '[自建] 🇯🇵VLESS-AWS-Tokyo-Reality',
@@ -3473,9 +3485,66 @@ class SubscriberRelayRenderTests(unittest.TestCase):
         # groups pruned: no DIRECT-only protocol fallback, relay reachable
         names = {g['name']: g['proxies'] for g in doc['proxy-groups']}
         self.assertNotIn('mesh-relay-pool', names)
-        self.assertIn('mango-relay', names['PROXY'])
+        self.assertIn('mango-relay-pool', names['PROXY'])
         self.assertEqual(meta['relay_added'], True)
         self.assertEqual(meta['relay_dropped'], 4)
+
+    def test_relay_pool_only_in_match_group_not_curated_groups(self):
+        # 2026-11-27: owner-curated business groups must fail over only
+        # among their own members; the relay pool is offered in PROXY only.
+        import yaml
+        doc = dict(self.doc)
+        doc['proxy-groups'] = list(self.doc['proxy-groups']) + [
+            {'name': '🎯Google', 'type': 'url-test',
+             'proxies': ['[自建] 🇺🇸AnyTLS-googlevps', '新加坡_BGP_B'],
+             'url': 'https://www.google.com/generate_204', 'interval': 300},
+            {'name': '🎯Claude', 'type': 'fallback',
+             'proxies': ['新加坡_BGP_B', '[share] US-Vmess1'],
+             'url': 'http://www.gstatic.com/generate_204', 'interval': 300},
+        ]
+        self.src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        _, out = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        groups = {g['name']: g['proxies'] for g in out['proxy-groups']}
+        self.assertIn('mango-relay-pool', groups['PROXY'])
+        self.assertEqual(groups['PROXY'].count('mango-relay-pool'), 1)
+        for g in ('🎯Google', '🎯Claude', 'AUTO'):
+            self.assertNotIn('mango-relay-pool', groups[g], g)
+        self.assertEqual(groups['🎯Google'], ['[自建] 🇺🇸AnyTLS-googlevps', '新加坡_BGP_B'])
+
+    def test_subscriber_render_bypasses_first_hop_servers(self):
+        import yaml
+        doc = dict(self.doc)
+        doc['proxies'] = list(self.doc['proxies']) + [
+            node('[自建] 🇭🇰TUIC-Azure', ntype='tuic', server='1.0.0.1',
+                 uuid='self-azure', password='x'),
+        ]
+        self.src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        _, out = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        rules = out['rules']
+        self.assertEqual(rules[-1], 'MATCH,PROXY')
+        self.assertIn('DOMAIN,relay.test.example,DIRECT', rules)
+        self.assertIn('DOMAIN,vps.example.com,DIRECT', rules)  # self-built, unchained
+        self.assertIn('IP-CIDR,1.0.0.1/32,DIRECT,no-resolve', rules)
+        # mesh twin 10.144.144.32 is private -> covered by GEOIP,LAN, no rule
+        self.assertFalse(any('10.144.144.32' in r for r in rules))
+        # airport servers are reached through the relay -> never bypassed
+        airport = {p['server'] for p in out['proxies']
+                   if p.get('dialer-proxy') == 'mango-relay-pool'}
+        for srv in airport:
+            self.assertFalse(any(f',{srv},' in r for r in rules), srv)
+        self.assertLess(rules.index('DOMAIN,relay.test.example,DIRECT'),
+                        rules.index('MATCH,PROXY'))
+
+    def test_server_direct_rule_shapes(self):
+        f = self.rp._server_direct_rule
+        self.assertEqual(f('8.8.4.4'), 'IP-CIDR,8.8.4.4/32,DIRECT,no-resolve')
+        self.assertEqual(f('[2606:4700::1111]'), 'IP-CIDR6,2606:4700::1111/128,DIRECT,no-resolve')
+        self.assertEqual(f('Relay.Example'), 'DOMAIN,relay.example,DIRECT')
+        self.assertIsNone(f('10.144.144.32'))
+        self.assertIsNone(f('127.0.0.1'))
+        self.assertIsNone(f(''))
+        self.assertEqual(self.rp._match_target(['GEOIP,LAN,DIRECT', 'MATCH,🚀Main']), '🚀Main')
+        self.assertEqual(self.rp._match_target([]), 'PROXY')
 
     def test_unprovisioned_user_stays_direct(self):
         meta, doc = self._render({})
@@ -3484,6 +3553,36 @@ class SubscriberRelayRenderTests(unittest.TestCase):
         for name in ('[tomorin] [anytls]JP Osaka Oracle', '新加坡_BGP_B'):
             self.assertNotIn('dialer-proxy', by_name[name], name)
         self.assertEqual(meta['relay_added'], False)
+
+    def test_whitelist_scope_user_render_ships_pool_group(self):
+        # 2026-11-27 review fix: scope!=full rebuilds final_groups AFTER the
+        # relay block; the pool group must survive that rebuild (externals
+        # dial mango-relay-pool — a dangling reference would break the whole
+        # subscription). Also asserts no dialer/group references a missing
+        # target.
+        os.environ['SHARE_SCOPE'] = 'whitelist'
+        import importlib
+        importlib.reload(self.rp)
+        self.wl.write_text(json.dumps(
+            ['[tomorin] [anytls]JP Osaka Oracle', '[share] US-Vmess1',
+             '新加坡_BGP_B']), encoding='utf-8')
+        meta, doc = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        node_names = {p['name'] for p in doc['proxies']}
+        group_names = {g['name'] for g in doc['proxy-groups']}
+        self.assertIn('mango-relay-pool', group_names)
+        pool = [g for g in doc['proxy-groups'] if g['name'] == 'mango-relay-pool'][0]
+        self.assertEqual(pool['proxies'], ['mango-relay', 'mango-relay-mesh'])
+        # every dialer-proxy target exists (nodes ∪ groups)
+        for p in doc['proxies']:
+            d = p.get('dialer-proxy')
+            if d:
+                self.assertIn(d, node_names | group_names, p['name'])
+        # every group member exists too
+        for g in doc['proxy-groups']:
+            for m in g.get('proxies') or []:
+                self.assertIn(m, node_names | group_names | {'DIRECT'},
+                              f"{g['name']} member {m}")
+        self.assertEqual(meta['relay_added'], True)
 
     def test_flag_off_keeps_byte_mirror(self):
         os.environ.pop('SHARE_SUBSCRIBER_RELAY', None)

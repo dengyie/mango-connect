@@ -27,7 +27,7 @@ def public_host(env: Optional[Mapping[str, str]] = None) -> str:
     env = env or os.environ
     return (env.get('SHARE_PUBLIC_HOST') or DEFAULT_PUBLIC_HOST).rstrip('/')
 
-RENDER_REV = '2'
+RENDER_REV = '3'
 # The profile name clients display (profile-title header / config filename).
 # This is a user-visible brand surface, NOT a technical identifier - the
 # technical ids (server_version, log prefixes) are separate literals.
