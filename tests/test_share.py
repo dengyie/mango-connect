@@ -3449,6 +3449,61 @@ class SubscriberRelayRenderTests(unittest.TestCase):
         import yaml
         return meta, yaml.safe_load(self.out.read_text(encoding='utf-8'))
 
+    def _render_with(self, extra_proxies, extra_groups, proxy_members, credentials=None):
+        import yaml
+        doc = dict(self.doc)
+        doc['proxies'] = list(self.doc['proxies']) + extra_proxies
+        doc['proxy-groups'] = [dict(self.doc['proxy-groups'][0], proxies=proxy_members)] \
+            + list(self.doc['proxy-groups'][1:]) + extra_groups
+        self.src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        return self._render(credentials or {'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+
+    def test_gradient_group_keeps_public_members_and_sheds_mesh_clones(self):
+        # 2026-11-27 REV 18: per-host hidden fallback gradients (public ->
+        # EasyTier mesh clone). Subscribers cannot reach the mesh clone, so
+        # it is pruned while the gradient survives on its public members.
+        grad = '[自建] 🇺🇸googlevps-梯度'
+        meta, doc = self._render_with(
+            [node('[自建] 🇺🇸AnyTLS-googlevps·mesh', ntype='anytls', server='10.0.0.4',
+                  password='shared-anytls', **{'dialer-proxy': '[自建] EasyTier-mesh-socks'})],
+            [{'name': grad, 'type': 'fallback', 'hidden': True,
+              'url': 'http://www.gstatic.com/generate_204', 'interval': 120,
+              'proxies': ['[自建] 🇺🇸AnyTLS-googlevps', '[自建] 🇺🇸AnyTLS-googlevps·mesh']}],
+            ['AUTO', grad])
+        groups = {g['name']: g for g in doc['proxy-groups']}
+        self.assertEqual(groups[grad]['proxies'], ['[自建] 🇺🇸AnyTLS-googlevps'])
+        self.assertTrue(groups[grad]['hidden'])
+        self.assertIn(grad, groups['PROXY']['proxies'])
+        self.assertNotIn('[自建] 🇺🇸AnyTLS-googlevps·mesh', {p['name'] for p in doc['proxies']})
+
+    def test_dropped_mesh_only_group_is_pruned_from_other_groups(self):
+        # A fallback gradient whose members are all mesh-only collapses to
+        # DIRECT and is removed; no group may keep a dangling reference to
+        # it (the pre-fix render left PROXY pointing at a missing group),
+        # and a select group emptied by the removal falls back to DIRECT.
+        grad = '[自建] 🇯🇵AWS-东京-梯度'
+        meta, doc = self._render_with(
+            [],
+            [{'name': grad, 'type': 'fallback', 'hidden': True,
+              'url': 'http://www.gstatic.com/generate_204', 'interval': 120,
+              'proxies': ['[自建] 🇯🇵VLESS-AWS-Tokyo-Reality']},
+             {'name': '🎯东京', 'type': 'select', 'proxies': [grad]}],
+            ['AUTO', grad, '🎯东京'])
+        names = {g['name'] for g in doc['proxy-groups']}
+        self.assertNotIn(grad, names)
+        self.assertNotIn('mesh-relay-pool', names)
+        builtin = {'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL'}
+        nodes = {p['name'] for p in doc['proxies']}
+        for g in doc['proxy-groups']:
+            for m in g.get('proxies') or []:
+                self.assertIn(m, nodes | names | builtin, f'{g["name"]} dangles on {m}')
+        self.assertEqual({g['name']: g for g in doc['proxy-groups']}['🎯东京']['proxies'], ['DIRECT'])
+
+    def test_relay_pool_group_is_hidden(self):
+        meta, doc = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
+        pool = {g['name']: g for g in doc['proxy-groups']}[self.rp.SUBSCRIBER_RELAY_MESH_GROUP]
+        self.assertIs(pool['hidden'], True)
+
     def test_provisioned_user_gets_relay_tier(self):
         meta, doc = self._render({'MANGO-RELAY': {'uuid': 'RELAY-UUID-ALICE'}})
         by_name = {p['name']: p for p in doc['proxies']}

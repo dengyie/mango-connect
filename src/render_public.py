@@ -220,6 +220,37 @@ def prune_groups(groups: List[Any], drop: set) -> List[Any]:
     return out
 
 
+_AUTO_GROUP_TYPES = ('fallback', 'url-test', 'load-balance')
+
+
+def prune_subscriber_groups(groups: List[Any], drop: set, rules: List[Any]) -> List[Any]:
+    """Subscriber-tier pruning. Protocol fallback groups (e.g. the owner's
+    per-host EasyTier gradients) whose members were all mesh-only collapse to
+    ['DIRECT'] and are dead weight, so they are removed - and their names are
+    then pruned from every other group too, iterating until stable, so no
+    group is left referencing a removed group (2026-11-27: dangling-member
+    fix). A group a rule targets is never removed."""
+    rule_targets = set()
+    for r in rules or []:
+        parts = [x.strip() for x in str(r).split(',')]
+        rule_targets.update(parts[1:])
+    removed = set(drop)
+    current = list(groups or [])
+    while True:
+        current = prune_groups(current, removed)
+        dead = {str(g.get('name')) for g in current
+                if isinstance(g, dict)
+                and g.get('type') in _AUTO_GROUP_TYPES
+                and 'DIRECT' in [str(m) for m in (g.get('proxies') or [])]
+                and str(g.get('name')) not in rule_targets}
+        dead -= removed
+        if not dead:
+            return current
+        removed |= dead
+        current = [g for g in current
+                   if not (isinstance(g, dict) and str(g.get('name')) in dead)]
+
+
 def _is_whitelisted(name: str, whitelist: List[str]) -> bool:
     return name in whitelist
 
@@ -416,6 +447,9 @@ def relay_pool_group_for() -> Dict[str, Any]:
     return {
         'name': SUBSCRIBER_RELAY_MESH_GROUP,
         'type': 'fallback',
+        # 2026-11-27: plumbing only (external nodes dial it) - keep it out
+        # of the client panel; routing still works for hidden groups.
+        'hidden': True,
         'url': 'http://www.gstatic.com/generate_204',
         'interval': 120,
         'lazy': False,
@@ -651,13 +685,8 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         if not names:
             raise ValueError('render produced zero nodes; refusing to publish an empty subscription')
         if relay_dropped:
-            final_groups = prune_groups(public_groups or [], _unreachable_for_subscribers(proxies))
-            # protocol fallback groups whose only members were mesh-only
-            # become ['DIRECT'] and are dead weight in the subscriber tier.
-            final_groups = [g for g in (final_groups or [])
-                            if not (isinstance(g, dict)
-                                    and g.get('type') in ('fallback', 'url-test', 'load-balance')
-                                    and [m for m in (g.get('proxies') or []) if str(m) == 'DIRECT'])]
+            final_groups = prune_subscriber_groups(
+                public_groups or [], _unreachable_for_subscribers(proxies), final_rules or [])
         if relay_added:
             # The relay pool is offered ONLY in the group the rules MATCH
             # into (normally PROXY). 2026-11-27: business groups (🎯Google /
