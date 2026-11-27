@@ -60,6 +60,26 @@ FAKE_NODE_RE = re.compile(DEFAULT_EXCLUDE_FILTER, re.IGNORECASE)
 # byte-mirror) is never touched. Off = exactly the pre-relay behavior.
 SUBSCRIBER_RELAY = os.environ.get('SHARE_SUBSCRIBER_RELAY', '') == '1'
 
+# Owner-only node prefixes (owner decision 2026-11-27): airports the owner
+# pays for personally (HutaoCloud / 宝可梦) ship ONLY in admin-role per-user
+# renders (the owner's mango-connect). Other subscribers never receive them,
+# so their traffic cannot burn the owner's airport quota. The plain mirror
+# render (owner devices) is untouched. Override: SHARE_OWNER_ONLY_PREFIXES
+# (comma-separated; empty string disables).
+OWNER_ONLY_PREFIXES = tuple(
+    x.strip() for x in os.environ.get(
+        'SHARE_OWNER_ONLY_PREFIXES', '[hutao] ,[pokemon] ').split(',') if x.strip())
+
+
+def owner_only_names(proxies: List[Any], prefixes: tuple = None) -> List[str]:
+    """Source proxy names reserved for the owner (prefix match)."""
+    prefixes = OWNER_ONLY_PREFIXES if prefixes is None else prefixes
+    if not prefixes:
+        return []
+    return [str(p['name']) for p in proxies
+            if isinstance(p, dict) and p.get('name')
+            and str(p['name']).startswith(prefixes)]
+
 
 def share_scope(env: Optional[Dict[str, str]] = None) -> str:
     """Sharing scope: 'whitelist' (legacy: share-nodes.json only) or 'full'
@@ -510,6 +530,7 @@ def render_user(source_path: Path, share_nodes_path: Path, exclude_path: Path,
                    other_secrets=other_secrets,
                    pool_dead_path=pool_dead_path,
                    user_name=str(user.get('username') or ''),
+                   owner_only=(user.get('role') == 'admin'),
                    scope=share_scope())
 
 
@@ -628,6 +649,7 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
             other_secrets: Optional[List[str]] = None,
             pool_dead_path: Optional[Path] = None,
             user_name: str = '',
+            owner_only: bool = True,
             scope: str = 'whitelist') -> Dict[str, Any]:
     exclude = load_json_list(exclude_path)
     pool_dead = load_json_list(pool_dead_path) if pool_dead_path else []
@@ -643,6 +665,10 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         raise ValueError(f'{source_path}: not a mapping')
     proxies = doc.get('proxies') or []
     whitelist = load_json_list(share_nodes_path)
+    if not owner_only:
+        # non-admin subscriber: owner-only airports never ship (treated as
+        # operator excludes, so group memberships are pruned the same way)
+        exclude = exclude + owner_only_names(proxies)
 
     if scope == 'full':
         # per-user path only (plain render took the mirror above): parse the

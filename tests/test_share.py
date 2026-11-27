@@ -144,6 +144,44 @@ class RenderTests(unittest.TestCase):
             ]), encoding='utf-8')
             self.ex.write_text(json.dumps(['[share] 🇺🇸US-Vmess1(Bwh)']), encoding='utf-8')
 
+    def test_owner_only_airports_ship_only_to_admin(self):
+        # 2026-11-27 owner decision: [hutao]/[pokemon] (owner-paid airports)
+        # only reach admin-role per-user renders; members never get them, in
+        # either scope, and their group memberships are pruned.
+        import yaml
+        doc = yaml.safe_load(self.src.read_text(encoding='utf-8'))
+        doc['proxies'] += [node('[hutao] 🇯🇵JP-01'), node('[pokemon] 🇸🇬SG-Vless02')]
+        doc['proxy-groups'][0]['proxies'] += ['[hutao] 🇯🇵JP-01', '[pokemon] 🇸🇬SG-Vless02']
+        self.src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        self.wl.write_text(json.dumps(['[自建] 🇺🇸VLESS-AWS-Oregon-Reality',
+                                       '[hutao] 🇯🇵JP-01']), encoding='utf-8')
+        self.ex.write_text(json.dumps([]), encoding='utf-8')
+        out_u = self.out.parent / 'users/u-x.yaml'
+        for scope in ('full', 'whitelist'):
+            os.environ['SHARE_SCOPE'] = scope
+            try:
+                for role, expect in (('user', False), ('admin', True)):
+                    rp.render_user(self.src, self.wl, self.ex, out_u, None,
+                                   user={'id': 'u-x', 'role': role, 'credentials': {}},
+                                   cred_map=[], other_secrets=[])
+                    text = out_u.read_text(encoding='utf-8')
+                    out = yaml.safe_load(text)
+                    names = [p['name'] for p in out['proxies']]
+                    self.assertEqual(any('[hutao]' in n for n in names), expect, (scope, role))
+                    if scope == 'full':
+                        self.assertEqual('[pokemon]' in text, expect, (scope, role))
+                        self.assertIn('[自建] 🇺🇸VLESS-AWS-Oregon-Reality', names)
+            finally:
+                os.environ['SHARE_SCOPE'] = 'whitelist'
+        self.assertEqual(rp.owner_only_names(doc['proxies'], ()), [])
+        # plain (owner mirror) render keeps them
+        os.environ['SHARE_SCOPE'] = 'full'
+        try:
+            rp.render(self.src, self.wl, self.ex, self.out, self.meta)
+            self.assertIn('[hutao]', self.out.read_text(encoding='utf-8'))
+        finally:
+            os.environ['SHARE_SCOPE'] = 'whitelist'
+
     def test_check_leaks_full_scope_warns_loop_guard(self):
         # full scope: loop-guard prefixes in the bytes are flagged for the
         # operator (gateway skip_merge is the primary guard)
