@@ -174,11 +174,42 @@ class RenderTests(unittest.TestCase):
             finally:
                 os.environ['SHARE_SCOPE'] = 'whitelist'
         self.assertEqual(rp.owner_only_names(doc['proxies'], ()), [])
-        # plain (owner mirror) render keeps them
+        # plain/global render (also the /sub fallback) never carries them,
+        # in either scope
+        for scope in ('full', 'whitelist'):
+            os.environ['SHARE_SCOPE'] = scope
+            try:
+                rp.render(self.src, self.wl, self.ex, self.out, self.meta)
+                text = self.out.read_text(encoding='utf-8')
+                self.assertNotIn('[hutao]', text, scope)
+                self.assertNotIn('[pokemon]', text, scope)
+            finally:
+                os.environ['SHARE_SCOPE'] = 'whitelist'
+
+    def test_owner_only_keep_back_fails_closed(self):
+        # a kept node dialing through an owner-only node (plan_drop keep-back)
+        # must abort the render, not silently ship the owner-only node
+        import yaml
+        doc = yaml.safe_load(self.src.read_text(encoding='utf-8'))
+        doc['proxies'] += [node('[hutao] 🇯🇵JP-01'),
+                           dict(node('chain-via-hutao'), **{'dialer-proxy': '[hutao] 🇯🇵JP-01'})]
+        self.src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        self.ex.write_text(json.dumps([]), encoding='utf-8')
         os.environ['SHARE_SCOPE'] = 'full'
         try:
-            rp.render(self.src, self.wl, self.ex, self.out, self.meta)
-            self.assertIn('[hutao]', self.out.read_text(encoding='utf-8'))
+            self.out.parent.mkdir(parents=True, exist_ok=True)
+            self.out.write_text('previous', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'owner-only'):
+                rp.render(self.src, self.wl, self.ex, self.out, self.meta)
+            self.assertEqual(self.out.read_text(encoding='utf-8'), 'previous')
+            with self.assertRaisesRegex(ValueError, 'owner-only'):
+                rp.render_user(self.src, self.wl, self.ex, self.out.parent / 'u.yaml', None,
+                               user={'id': 'u', 'role': 'user', 'credentials': {}},
+                               cred_map=[], other_secrets=[])
+            # admin keeps the full chain
+            rp.render_user(self.src, self.wl, self.ex, self.out.parent / 'a.yaml', None,
+                           user={'id': 'a', 'role': 'admin', 'credentials': {}},
+                           cred_map=[], other_secrets=[])
         finally:
             os.environ['SHARE_SCOPE'] = 'whitelist'
 
@@ -2256,6 +2287,63 @@ class PerUserYamlTests(AccountHarness):
         self.assertEqual(headers.get('profile-title'), 'mango-connect-demo1')
         self.assertIn('filename=mango-connect-demo1',
                       headers.get('Content-Disposition', ''))
+
+    def _add_owner_only_node(self):
+        import yaml
+        src = Path(self.tmp.name) / 'airports' / 'mango-clash.yaml'
+        doc = yaml.safe_load(src.read_text(encoding='utf-8'))
+        doc['proxies'].append({'name': '[hutao] 🇯🇵JP-01', 'type': 'ss',
+                               'server': '5.6.7.8', 'port': 8388,
+                               'cipher': 'aes-128-gcm', 'password': 'HUTAO-PW'})
+        doc['proxy-groups'] = [{'name': 'PROXY', 'type': 'select',
+                                'proxies': ['[自建] demo-reality', '[hutao] 🇯🇵JP-01']}]
+        doc['rules'] = ['MATCH,PROXY']
+        src.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding='utf-8')
+        os.environ['SHARE_SCOPE'] = 'full'
+        self.addCleanup(os.environ.pop, 'SHARE_SCOPE', None)
+
+    def test_global_fallbacks_never_carry_owner_only_nodes(self):
+        self._add_owner_only_node()
+        # standalone token -> global render
+        _, token = tk.create_token(tk.token_file(), 'legacy')
+        status, _, body = self._req(f'/sub/{token}')
+        self.assertEqual(status, 200)
+        self.assertIn('demo-reality', body.decode())
+        self.assertNotIn('[hutao]', body.decode())
+        # provisioned user whose per-user render blows up -> global fallback
+        ck, csrf = self._login()
+        demo_token = self._create_demo_user(ck, csrf)
+        self.us.ensure_node_credentials(self.us.users_file(), 'demo-node')
+        (Path(self.tmp.name) / 'node-credentials.json').write_text(
+            json.dumps([{'node': '[自建] demo-reality', 'key': 'demo-node',
+                         'type': 'vless'}]), encoding='utf-8')
+        import render_public as rp_srv
+        orig = rp_srv.render_user
+        rp_srv.render_user = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
+        try:
+            status, _, body = self._req(f'/sub/{demo_token}')
+        finally:
+            rp_srv.render_user = orig
+        self.assertEqual(status, 200)
+        self.assertNotIn('[hutao]', body.decode())
+
+    def test_role_change_rerenders_owner_only_nodes(self):
+        self._add_owner_only_node()
+        ck, csrf = self._login()
+        demo_token = self._create_demo_user(ck, csrf)
+        self.us.ensure_node_credentials(self.us.users_file(), 'demo-node')
+        (Path(self.tmp.name) / 'node-credentials.json').write_text(
+            json.dumps([{'node': '[自建] demo-reality', 'key': 'demo-node',
+                         'type': 'vless'}]), encoding='utf-8')
+        status, _, body = self._req(f'/sub/{demo_token}')
+        self.assertEqual(status, 200)
+        self.assertNotIn('[hutao]', body.decode())
+        self._update_demo(lambda r: r.__setitem__('role', 'admin'))
+        status, _, body = self._req(f'/sub/{demo_token}')
+        self.assertIn('[hutao]', body.decode())
+        self._update_demo(lambda r: r.__setitem__('role', 'user'))
+        status, _, body = self._req(f'/sub/{demo_token}')
+        self.assertNotIn('[hutao]', body.decode())
 
     def test_unprovisioned_user_gets_global_yaml(self):
         _, token = tk.create_token(tk.token_file(), 'legacy')

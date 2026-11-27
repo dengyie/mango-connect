@@ -63,12 +63,15 @@ SUBSCRIBER_RELAY = os.environ.get('SHARE_SUBSCRIBER_RELAY', '') == '1'
 # Owner-only node prefixes (owner decision 2026-11-27): airports the owner
 # pays for personally (HutaoCloud / 宝可梦) ship ONLY in admin-role per-user
 # renders (the owner's mango-connect). Other subscribers never receive them,
-# so their traffic cannot burn the owner's airport quota. The plain mirror
-# render (owner devices) is untouched. Override: SHARE_OWNER_ONLY_PREFIXES
-# (comma-separated; empty string disables).
+# so their traffic cannot burn the owner's airport quota. Every other output
+# (plain/global mirror, whitelist scope, non-admin per-user renders - which
+# are also what /sub falls back to) excludes them; if a kept node or rule
+# still needs one (plan_drop keep-back) the render raises instead of
+# publishing. Override: SHARE_OWNER_ONLY_PREFIXES (comma-separated, matched
+# after strip, e.g. "[hutao],[pokemon]"; empty string disables).
 OWNER_ONLY_PREFIXES = tuple(
     x.strip() for x in os.environ.get(
-        'SHARE_OWNER_ONLY_PREFIXES', '[hutao] ,[pokemon] ').split(',') if x.strip())
+        'SHARE_OWNER_ONLY_PREFIXES', '[hutao],[pokemon]').split(',') if x.strip())
 
 
 def owner_only_names(proxies: List[Any], prefixes: tuple = None) -> List[str]:
@@ -79,6 +82,17 @@ def owner_only_names(proxies: List[Any], prefixes: tuple = None) -> List[str]:
     return [str(p['name']) for p in proxies
             if isinstance(p, dict) and p.get('name')
             and str(p['name']).startswith(prefixes)]
+
+
+def assert_no_owner_only(proxies: List[Any], include_owner_only: bool) -> None:
+    """Fail-closed leak gate: a non-owner output must not carry owner-only
+    nodes (plan_drop may keep one back when a kept node/rule references it)."""
+    if include_owner_only:
+        return
+    leaked = owner_only_names(proxies)
+    if leaked:
+        raise ValueError(f'owner-only nodes survived the render ({len(leaked)}); '
+                         'a kept node or rule still references them - refusing to publish')
 
 
 def share_scope(env: Optional[Dict[str, str]] = None) -> str:
@@ -530,7 +544,7 @@ def render_user(source_path: Path, share_nodes_path: Path, exclude_path: Path,
                    other_secrets=other_secrets,
                    pool_dead_path=pool_dead_path,
                    user_name=str(user.get('username') or ''),
-                   owner_only=(user.get('role') == 'admin'),
+                   include_owner_only=(user.get('role') == 'admin'),
                    scope=share_scope())
 
 
@@ -564,12 +578,15 @@ def _substitute_credentials(picked: List[Dict[str, Any]],
 def _render_full_mirror(source_path: Path, out_path: Path,
                         meta_path: Optional[Path],
                         exclude: Optional[List[str]] = None,
-                        pool_dead: Optional[List[str]] = None) -> Dict[str, Any]:
+                        pool_dead: Optional[List[str]] = None,
+                        include_owner_only: bool = False) -> Dict[str, Any]:
     """Full scope = mirror of the gateway's own client export. With nothing
     to drop the output is the source file verbatim (byte-identical to the
     owner's devices; the gateway already kernel-validated it). When exclude /
-    the node pool's dead list remove nodes, the document is re-serialized
-    with those proxies and their group memberships pruned. Alignment always
+    the node pool's dead list / owner-only airports remove nodes, the document
+    is re-serialized with those proxies and their group memberships pruned.
+    If the source cannot be parsed while owner-only filtering is on, the
+    render raises (a verbatim mirror could leak them). Alignment always
     compares the SOURCE against the gateway meta."""
     source_bytes = source_path.read_bytes()
     source_sha = hashlib.sha256(source_bytes).hexdigest()
@@ -585,10 +602,19 @@ def _render_full_mirror(source_path: Path, out_path: Path,
     floor_hit = False
     out_bytes = source_bytes
     source_count = node_count
+    exclude = list(exclude or [])
+    if not include_owner_only and OWNER_ONLY_PREFIXES:
+        if not isinstance(doc, dict):
+            raise ValueError(f'{source_path}: unparseable; refusing a verbatim '
+                             'mirror that may carry owner-only nodes')
+        exclude += owner_only_names(doc.get('proxies') or [])
     if isinstance(doc, dict) and (exclude or pool_dead):
         proxies = doc.get('proxies') or []
         drop, pool_dropped, floor_hit = plan_drop(
-            proxies, doc.get('rules') or [], exclude or [], pool_dead or [])
+            proxies, doc.get('rules') or [], exclude, pool_dead or [])
+        assert_no_owner_only(
+            [p for p in proxies if isinstance(p, dict) and p.get('name') not in drop],
+            include_owner_only)
         if drop:
             pruned = dict(doc)
             pruned['proxies'] = [p for p in proxies
@@ -649,7 +675,7 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
             other_secrets: Optional[List[str]] = None,
             pool_dead_path: Optional[Path] = None,
             user_name: str = '',
-            owner_only: bool = True,
+            include_owner_only: bool = False,
             scope: str = 'whitelist') -> Dict[str, Any]:
     exclude = load_json_list(exclude_path)
     pool_dead = load_json_list(pool_dead_path) if pool_dead_path else []
@@ -657,7 +683,8 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         # mirror of the gateway's own client export (verbatim unless the
         # exclude list / node pool drops something)
         return _render_full_mirror(source_path, out_path, meta_path,
-                                   exclude=exclude, pool_dead=pool_dead)
+                                   exclude=exclude, pool_dead=pool_dead,
+                                   include_owner_only=include_owner_only)
     import yaml
 
     doc = yaml.safe_load(source_path.read_text(encoding='utf-8'))
@@ -665,8 +692,8 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
         raise ValueError(f'{source_path}: not a mapping')
     proxies = doc.get('proxies') or []
     whitelist = load_json_list(share_nodes_path)
-    if not owner_only:
-        # non-admin subscriber: owner-only airports never ship (treated as
+    if not include_owner_only:
+        # everyone but the admin: owner-only airports never ship (treated as
         # operator excludes, so group memberships are pruned the same way)
         exclude = exclude + owner_only_names(proxies)
 
@@ -680,6 +707,7 @@ def _render(source_path: Path, share_nodes_path: Path, exclude_path: Path,
     else:
         picked = select_nodes(proxies, whitelist, exclude + pool_dead)
         public_groups, public_rules = None, None
+    assert_no_owner_only(picked, include_owner_only)
     names = [p['name'] for p in picked]
     if not names:
         raise ValueError('render produced zero nodes; refusing to publish an empty subscription')

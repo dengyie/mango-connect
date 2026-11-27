@@ -117,14 +117,16 @@ class ShareState:
     def ensure_user_fresh(self, user: dict) -> tuple:
         """Render (or reuse) the per-user YAML; returns (path, sha256).
         Fingerprint covers every render input plus the user's own
-        credentials, so a credential rotation re-renders immediately."""
+        credentials and role (role gates owner-only airports), so a
+        credential rotation or role change re-renders immediately."""
         uid = str(user['id'])
         creds = user.get('credentials') or {}
         cred_map = self._node_cred_map()
         h = hashlib.sha256()
         self._hash_inputs(h)
         h.update(hashlib.sha256(
-            json.dumps({'c': creds, 'm': cred_map}, sort_keys=True,
+            json.dumps({'c': creds, 'm': cred_map, 'r': user.get('role')},
+                       sort_keys=True,
                        ensure_ascii=False).encode('utf-8')).digest())
         sha_in = h.hexdigest()
         memo = self.user_renders.get(uid)
